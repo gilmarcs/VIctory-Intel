@@ -935,7 +935,7 @@ fn create() -> windows::core::Result<Host> {
             .is_ok()
         {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
-            victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+            victory_shader::emit::set_host_wave_range(o1.WaveLaneCountMin, o1.WaveLaneCountMax);
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
@@ -2078,7 +2078,7 @@ cbuffer Span : register(b0) {
 ByteAddressBuffer now : register(t0);
 // 16 bytes per piece of the copy: the hash of its bytes when they were
 // last sent up (or hashed whole, the first time).
-RWByteAddressBuffer hashes : register(u0);
+RWStructuredBuffer<uint4> hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
 groupshared uint4 parts[64];
 [RootSignature(RS)]
@@ -2137,12 +2137,12 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     if (compare != 0u) {
         // The flag, and above it 31 bits of the hash (`torn`).
         uint folded = h.x ^ (h.y * 3u) ^ (h.z * 5u) ^ (h.w * 7u);
-        differs.Store(out_at + id.x * 4u, (folded << 1u) | (any(h != hashes.Load4(piece * 16u)) ? 1u : 0u));
+        differs.Store(out_at + id.x * 4u, (folded << 1u) | (any(h != hashes[piece]) ? 1u : 0u));
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
+        if (compare == 2u) hashes[piece] = h;
     } else {
-        hashes.Store4(piece * 16u, h);
+        hashes[piece] = h;
     }
 }
 "#;
@@ -4212,13 +4212,19 @@ impl Host {
                 true
             }
             Err(e) => {
-                tracing::warn!(error = %e, "no host copies in the card's memory: the compare could not be made");
+                tracing::warn!(error = %e, reason = %e.message(), "no host copies in the card's memory: the compare could not be made");
                 false
             }
         })
     }
 
-    fn make_card_work(&self) -> windows::core::Result<CardWork> {
+    /// Logs the step of the card's compare that failed, with its HRESULT.
+    fn card_stage(step: &str, e: windows::core::Error) -> windows::core::Error {
+        tracing::warn!(step, hresult = %e.code(), "card compare step failed");
+        e
+    }
+
+    fn card_pipeline(device: &ID3D12Device) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let mut code: Option<ID3DBlob> = None;
@@ -4237,31 +4243,73 @@ impl Host {
                 0,
                 &mut code,
                 None,
-            )?;
+            )
+            .map_err(|e| Self::card_stage("D3DCompile", e))?;
         }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
-        let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
-        // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
-        // in one submission.
-        const RESULTS: u64 = 1 << 20;
-        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
-        name(&differs, || "card compare results".into());
-        // SAFETY: the blob's own bytes; the root signature is inside the
-        // shader.
+        let code = code.ok_or_else(|| Self::card_stage("no blob", windows::core::Error::empty()))?;
+        // SAFETY: descriptions and blob bytes remain alive through the calls.
         unsafe {
             let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
-            let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // Match CARD_COMPARE's root layout without relying on the compiler
+            // embedding a root signature in its shader blob.
+            let mut params = vec![D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 6 },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            }];
+            for (kind, register) in [
+                (D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
+                (D3D12_ROOT_PARAMETER_TYPE_UAV, 0),
+                (D3D12_ROOT_PARAMETER_TYPE_UAV, 1),
+            ] {
+                params.push(D3D12_ROOT_PARAMETER {
+                    ParameterType: kind,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: register, RegisterSpace: 0 },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                });
+            }
+            let desc = D3D12_ROOT_SIGNATURE_DESC {
+                NumParameters: params.len() as u32,
+                pParameters: params.as_ptr(),
+                ..Default::default()
+            };
+            let mut signature: Option<ID3DBlob> = None;
+            D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut signature, None)
+                .map_err(|e| Self::card_stage("serialize root signature", e))?;
+            let signature = signature.ok_or_else(|| Self::card_stage("no root signature blob", windows::core::Error::empty()))?;
+            let signature_bytes = std::slice::from_raw_parts(signature.GetBufferPointer().cast::<u8>(), signature.GetBufferSize());
+            let root: ID3D12RootSignature = device
+                .CreateRootSignature(0, signature_bytes)
+                .map_err(|e| Self::card_stage("root signature", e))?;
+            let pso: ID3D12PipelineState = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
                     pShaderBytecode: bytes.as_ptr().cast(),
                     BytecodeLength: bytes.len(),
                 },
                 ..Default::default()
-            })?;
+            })
+            .map_err(|e| Self::card_stage("pipeline state", e))?;
             #[cfg(feature = "diagnostics")]
             name(&pso, || crate::replay::play::COMPARE.into());
-            Ok(CardWork {
+            Ok((root, pso))
+        }
+    }
+
+    fn make_card_work(&self) -> windows::core::Result<CardWork> {
+        let (root, pso) = Self::card_pipeline(&self.device)?;
+        let list = || self.make_prelude().ok_or_else(|| Self::card_stage("no command list", windows::core::Error::empty()));
+        // A megabyte of results: 262,144 pieces, 16 GB of declared ranges.
+        const RESULTS: u64 = 1 << 20;
+        let (differs, data) = self
+            .shared_buffer(RESULTS)
+            .ok_or_else(|| Self::card_stage("no results buffer", windows::core::Error::empty()))?;
+        name(&differs, || "card compare results".into());
+        Ok(CardWork {
                 sync: vec![list()?],
                 check: vec![list()?],
                 fetch: list()?,
@@ -4271,8 +4319,7 @@ impl Host {
                 fetched: None,
                 taken: 0,
                 out: 0,
-            })
-        }
+        })
     }
 
     /// Before a submission's lists run, for copies in the card's memory
@@ -8969,6 +9016,7 @@ impl Meter {
                     put[3]
                 );
                 traffic::line(self.copy_stats_frames as f64);
+                crate::shadow::echo_probe_line(self.copy_stats_frames as f64);
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
@@ -10758,5 +10806,144 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+}
+
+#[cfg(test)]
+mod compile_probe {
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::core::s;
+
+    fn blob_text(b: Option<&ID3DBlob>) -> String {
+        let Some(b) = b else { return String::new() };
+        // SAFETY: the blob's own bytes, alive while `b` is.
+        unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())).into_owned() }
+    }
+
+    /// Compiles `source` the way the card compare is compiled, and says what
+    /// the compiler wrote when it refuses.
+    pub(super) fn compile(source: &str) -> Result<(), String> {
+        compile_as(source, s!("cs_5_1"))
+    }
+
+    pub(super) fn compile_as(source: &str, profile: windows::core::PCSTR) -> Result<(), String> {
+        let mut code: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call; the out pointers are ours.
+        let r = unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                s!("probe"),
+                None,
+                None,
+                s!("main"),
+                profile,
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        };
+        r.map_err(|e| format!("{e} | compiler: {}", blob_text(errors.as_ref())))
+    }
+
+    #[test]
+    fn a_trivial_compute_shader_compiles_here() {
+        let source = "[numthreads(1, 1, 1)] void main(uint3 id : SV_DispatchThreadID) {}";
+        compile(source).unwrap_or_else(|e| panic!("trivial shader: {e}"));
+    }
+
+    #[test]
+    fn structured_buffer_read_write_compiles_here() {
+        let source = "RWStructuredBuffer<uint4> hashes : register(u0); RWByteAddressBuffer out_ : register(u1); [numthreads(1,1,1)] void main(uint3 id : SV_DispatchThreadID) { uint4 h = hashes[id.x]; out_.Store(0, h.x); hashes[id.x] = h + 1; }";
+        compile(source).unwrap_or_else(|e| panic!("structured buffer: {e}"));
+    }
+
+    #[test]
+    fn the_card_compare_compiles_here() {
+        compile(super::CARD_COMPARE).unwrap_or_else(|e| panic!("card compare: {e}"));
+    }
+
+    #[test]
+    fn the_card_compare_pipeline_can_be_created() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
+        let mut device: Option<ID3D12Device> = None;
+        unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }
+            .expect("D3D12 device");
+        super::Host::card_pipeline(&device.expect("device returned"))
+            .expect("card compare root signature and pipeline");
+    }
+
+    #[test]
+    fn the_card_compare_modes_preserve_and_update_hashes() {
+        use super::*;
+        use windows::core::Interface;
+
+        let host = host().expect("D3D12 host");
+        let (root, pso) = Host::card_pipeline(&host.device).expect("compare pipeline");
+        let (now, now_map) = host.shared_buffer(65536).expect("input buffer");
+        let (hashes, _) = host.shared_buffer(16).expect("hash buffer");
+        let (differs, result) = host.shared_buffer(4).expect("result buffer");
+        // SAFETY: all mappings and D3D objects live until each fenced dispatch
+        // completes; CPU writes and reads occur only after the previous fence.
+        unsafe {
+            let device = &host.device;
+            let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            }).unwrap();
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut first = true;
+            for (step, (byte, mode, expected)) in [
+                (17u8, 0u32, None),
+                (17, 1, Some(0)),
+                (42, 1, Some(1)),
+                (42, 1, Some(1)),
+                (42, 2, Some(1)),
+                (42, 1, Some(0)),
+                (17, 1, Some(1)),
+            ].into_iter().enumerate() {
+                std::ptr::write_bytes(now_map, byte, 65536);
+                let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+                if first {
+                    list.ResourceBarrier(&[
+                        transition(&now, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                        transition(&hashes, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                        transition(&differs, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                    ]);
+                    first = false;
+                }
+                list.SetComputeRootSignature(&root);
+                list.SetPipelineState(&pso);
+                list.SetComputeRootShaderResourceView(1, now.GetGPUVirtualAddress());
+                list.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
+                list.SetComputeRootUnorderedAccessView(3, differs.GetGPUVirtualAddress());
+                let constants = [0u32, 0, 65536, 1, 0, mode];
+                list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                list.Dispatch(1, 1, 1);
+                list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(None),
+                        }),
+                    },
+                }]);
+                list.Close().unwrap();
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                let value = step as u64 + 1;
+                queue.Signal(&fence, value).unwrap();
+                fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default()).unwrap();
+                device.GetDeviceRemovedReason().expect("device lost");
+                if let Some(expected) = expected {
+                    assert_eq!(result.cast::<u32>().read() & 1, expected, "step {step}, mode {mode}");
+                }
+            }
+        }
     }
 }

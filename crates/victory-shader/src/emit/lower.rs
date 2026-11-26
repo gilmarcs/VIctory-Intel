@@ -1109,6 +1109,25 @@ pub fn set_host_max_wave(lanes: u32) {
     HOST_MAX_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The host GPU's `WaveLaneCountMin` (0: not known, no lower bound is checked).
+static HOST_MIN_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The host's wave sizes, both ends: a program's `WaveSize` must lie between them (the D3D12
+/// runtime refuses the pipeline otherwise, see `HLSL_SM_6_6_WaveSize.md`). Sets the widest too
+/// ([`set_host_max_wave`]).
+pub fn set_host_wave_range(min: u32, max: u32) {
+    HOST_MIN_WAVE.store(min, std::sync::atomic::Ordering::Relaxed);
+    set_host_max_wave(max);
+}
+
+/// Whether a program of `lanes` can run on this host: within the reported range
+/// ([`set_host_wave_range`]); a range not known admits any size.
+pub fn wave_fits(lanes: u32) -> bool {
+    let min = HOST_MIN_WAVE.load(std::sync::atomic::Ordering::Relaxed);
+    let max = host_max_wave();
+    (min == 0 || lanes >= min) && (max == 0 || lanes <= max)
+}
+
 thread_local! {
     /// See [`take_needs`].
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -1184,10 +1203,16 @@ fn own_bits_on() -> bool {
 }
 
 /// What the translator was told of the host, for a cache's key: the widest
-/// wave, the view heap's limit, where the raw twins of its views start, and
-/// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+/// wave, the view heap's limit, where the raw twins of its views start, what it
+/// writes for the console's own hardware, and the narrowest wave.
+pub fn host_settings() -> [u32; 5] {
+    [
+        host_max_wave(),
+        super::shader::view_heap_limit(),
+        super::shader::raw_views(),
+        host_rdna(),
+        HOST_MIN_WAVE.load(std::sync::atomic::Ordering::Relaxed),
+    ]
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1231,6 +1256,57 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     let result = translate();
     FIRST_HALF_PAIRS.set(before);
     result
+}
+
+/// Why a console wave64 program stays at 64 lanes on a host of 32 ([`wave64_refusal`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Wave64Refusal {
+    /// Cross-lane code past the 32-lane halves: masks, lane reads, permutes.
+    CrossesHalves,
+    /// LDS shared within the group with no barrier every thread reaches.
+    Lds,
+    /// Both of the above.
+    CrossesHalvesAndLds,
+    /// Neither reason was recorded.
+    Other,
+}
+
+thread_local! {
+    /// The last lowering's [`Wave64Refusal`] on this thread (set where the program stays wave64).
+    static WAVE64_REFUSAL: std::cell::Cell<Wave64Refusal> = const { std::cell::Cell::new(Wave64Refusal::Other) };
+}
+
+pub(super) fn set_wave64_refusal(why: Wave64Refusal) {
+    WAVE64_REFUSAL.set(why);
+}
+
+/// The reason of the last wave64 lowering on this thread that kept 64 lanes.
+pub(super) fn wave64_refusal() -> Wave64Refusal {
+    WAVE64_REFUSAL.get()
+}
+
+/// What the vkd3d-proton clamp (`CLAMP_WAVE_SIZE_TO_THREAD_GROUP32`) would do with a program
+/// that stays at 64 lanes: `exact` when the clamp gives the same results.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Wave64Clamp {
+    pub group: u32,
+    pub exact: bool,
+    pub lds: bool,
+    pub crossing: bool,
+}
+
+thread_local! {
+    /// The last wave64 lowering's [`Wave64Clamp`] on this thread (`None`: it kept 32 lanes).
+    static WAVE64_CLAMP: std::cell::Cell<Option<Wave64Clamp>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn set_wave64_clamp(v: Wave64Clamp) {
+    WAVE64_CLAMP.set(Some(v));
+}
+
+/// Takes (and clears) the clamp verdict of the last lowering on this thread.
+pub(super) fn take_wave64_clamp() -> Option<Wave64Clamp> {
+    WAVE64_CLAMP.replace(None)
 }
 
 pub(super) fn host_max_wave() -> u32 {
@@ -1567,8 +1643,9 @@ impl<'a> Lower<'a> {
                         }
                     }
                 }
-                // `VICTORY_WAVE_WHY=1`: why a program keeps 64-lane waves (one line per reason)
-                if wave == 64 && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                // Why a program keeps 64-lane waves: recorded for the refusal (`wave64_refusal`), and
+                // printed with `VICTORY_WAVE_WHY=1`, one line per reason.
+                if wave == 64 {
                     let mut why: Vec<&str> = Vec::new();
                     for i in insts() {
                         let n = i.name();
@@ -1603,7 +1680,30 @@ impl<'a> Lower<'a> {
                         }
                     }
                     why.sort_unstable();
-                    eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
+                    let lds = why.iter().any(|r| {
+                        matches!(*r, "LDS in a group over 32" | "an indirect exit" | "an LDS read and write in one lane-branch region")
+                    });
+                    let crossing = !x.st.wide.is_empty()
+                        || why.iter().any(|r| !matches!(*r, "LDS in a group over 32" | "an indirect exit" | "an LDS read and write in one lane-branch region"));
+                    set_wave64_refusal(match (crossing, lds) {
+                        (true, true) => Wave64Refusal::CrossesHalvesAndLds,
+                        (true, false) => Wave64Refusal::CrossesHalves,
+                        (false, true) => Wave64Refusal::Lds,
+                        (false, false) => Wave64Refusal::Other,
+                    });
+                    // The vkd3d-proton / dxil-spirv baseline (`CLAMP_WAVE_SIZE_TO_THREAD_GROUP32`)
+                    // runs every program at 32 lanes: exact only when no cross-half code and no LDS
+                    // shared over a group of more than 32 threads. Logged per refused program, so
+                    // the two can be compared on the same shaders.
+                    set_wave64_clamp(Wave64Clamp {
+                        group,
+                        exact: !crossing && (s.lds_dwords == 0 || group <= 32),
+                        lds: s.lds_dwords > 0,
+                        crossing,
+                    });
+                    if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                        eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
+                    }
                 }
             }
             if wave == 32 && x.native.wave64 {

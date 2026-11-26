@@ -2030,6 +2030,35 @@ fn land_echo() -> bool {
 /// bytes a landing was noted in that were the title's too.
 pub(crate) static ECHO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Diagnostics (`VICTORY_ECHO_PROBE=1`): bytes sent whole from copies with
+/// no card side that already equal title memory, and that differ; and bytes
+/// copy-back wrote into title memory.
+#[cfg(feature = "diagnostics")]
+pub(crate) static ECHO_PROBE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+#[cfg(feature = "diagnostics")]
+fn echo_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ECHO_PROBE").is_some_and(|v| v == "1"))
+}
+
+/// The probe's line, for the frame.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn echo_probe_line(frames: f64) {
+    if !echo_probe() {
+        return;
+    }
+    let [same, differ, back] = std::array::from_fn(|i| ECHO_PROBE[i].swap(0, Ordering::Relaxed));
+    let mb = |b: u64| b as f64 / 1e6 / frames.max(1.0);
+    tracing::info!(
+        "copy-back probe per frame: {:.1} MB sent whole from copies without a card side ({:.1} MB identical to title memory, {:.1} MB changed); copy-back wrote {:.1} MB into title memory",
+        mb(same + differ),
+        mb(same),
+        mb(differ),
+        mb(back)
+    );
+}
+
 /// Whether a refresh of a copy in the card's memory takes, and sends up,
 /// the dwords that title memory changed and no others
 /// (`VICTORY_SEND_CHANGED=1`; off: the 64 KiB pages written since it last
@@ -3217,6 +3246,8 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
         }
+        #[cfg(feature = "diagnostics")]
+        ECHO_PROBE[2].fetch_add(written as u64, Ordering::Relaxed);
         written
     }
 
@@ -4082,6 +4113,16 @@ impl Shadow {
                 crate::host::upcheck::note(self.id, a, &was, &self.card_held(a, b - a));
             });
         } else {
+            #[cfg(feature = "diagnostics")]
+            if self.card.is_none() && from < to && echo_probe() {
+                let mut title = vec![0u8; to - from];
+                crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, to - from, false);
+                // SAFETY: inside the mapping, read before it is overwritten below.
+                let held = unsafe { std::slice::from_raw_parts(at as *const u8, to - from) };
+                let same = title.iter().zip(held).filter(|(a, b)| a == b).count() as u64;
+                ECHO_PROBE[0].fetch_add(same, Ordering::Relaxed);
+                ECHO_PROBE[1].fetch_add((to - from) as u64 - same, Ordering::Relaxed);
+            }
             crate::host::copy_mapped(at, from as *const u8, to - from, false);
         }
         // After the bytes are in: a snapshot taken meanwhile is not current.

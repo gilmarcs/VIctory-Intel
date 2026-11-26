@@ -1044,7 +1044,7 @@ pub(crate) fn opened_for_writing(at: usize) {
 
 /// An asking made blocks of `pages` clean and noted them in the journal.
 fn publish(pages: &[usize]) {
-    let g = guards();
+    let g = guards_for(GuardSite::Publish);
     for &page in pages {
         if g.clean.contains(page) || g.held.contains(page) {
             PUBLISHED.set(page);
@@ -1202,14 +1202,16 @@ fn tally(what: usize, n: u64) {
 /// [`ASKS`], taken.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn asks() -> [u64; 13] {
+    #[cfg(feature = "diagnostics")]
+    report_guard_holds();
     std::array::from_fn(|i| ASKS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// The guards' lock, the wait for it counted.
-fn guards_timed() -> std::sync::MutexGuard<'static, Guards> {
+fn guards_timed(site: GuardSite) -> GuardLock {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    let g = guards();
+    let g = guards_for(site);
     #[cfg(feature = "diagnostics")]
     tally(7, started.elapsed().as_nanos() as u64);
     g
@@ -1425,11 +1427,209 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
 });
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    if let Ok(g) = GUARDS.try_lock() {
-        return g;
+#[derive(Clone, Copy)]
+enum GuardSite {
+    Other,
+    Query,
+    Protect,
+    Write,
+    Mapping,
+    Fault,
+    Publish,
+}
+
+/// A held guard, optionally timed from acquisition until release. The
+/// counters are updated after unlocking, never under the measured mutex.
+struct GuardLock {
+    inner: Option<std::sync::MutexGuard<'static, Guards>>,
+    #[cfg(feature = "diagnostics")]
+    started: Option<std::time::Instant>,
+    #[cfg(feature = "diagnostics")]
+    site: GuardSite,
+}
+
+impl std::ops::Deref for GuardLock {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        self.inner.as_deref().expect("guard held")
     }
-    waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+impl std::ops::DerefMut for GuardLock {
+    fn deref_mut(&mut self) -> &mut Guards {
+        self.inner.as_deref_mut().expect("guard held")
+    }
+}
+
+impl Drop for GuardLock {
+    fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        let elapsed = self.started.map(|start| start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        drop(self.inner.take());
+        #[cfg(feature = "diagnostics")]
+        if let Some(ns) = elapsed {
+            use std::sync::atomic::Ordering::Relaxed;
+            let stats = &GUARD_HOLDS[self.site as usize];
+            stats[0].fetch_add(1, Relaxed);
+            stats[1].fetch_add(ns, Relaxed);
+            stats[2].fetch_max(ns, Relaxed);
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+static GUARD_HOLDS: [[std::sync::atomic::AtomicU64; 3]; 7] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 7];
+
+/// Calls, failures, blocks, total and longest elapsed nanoseconds, by path.
+#[cfg(feature = "diagnostics")]
+static PROTECTION_CALLS: [[std::sync::atomic::AtomicU64; 5]; 3] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 5] }; 3];
+
+#[cfg(feature = "diagnostics")]
+static PROTECT_ERRORS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Bounded samples of failed calls: sampled, initial, fallback, multiple
+/// query regions, uncommitted, multiple allocations, mixed protections,
+/// incomplete query. Categories can overlap.
+#[cfg(feature = "diagnostics")]
+static FAILED_REGIONS: [std::sync::atomic::AtomicU64; 8] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+#[cfg(feature = "diagnostics")]
+fn inspect_failed_region(from: usize, to: usize, initial: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // Bound the extra queries while the guards' lock is held.
+    if FAILED_REGIONS[0].fetch_add(1, Relaxed) >= 32 {
+        return;
+    }
+    FAILED_REGIONS[if initial { 1 } else { 2 }].fetch_add(1, Relaxed);
+    let (mut at, end) = (from * BLOCK, to * BLOCK);
+    let (mut regions, mut uncommitted, mut allocations, mut protections, mut incomplete) = (0, false, false, false, false);
+    let (mut allocation, mut protection) = (None, None);
+    while at < end {
+        if regions == 32 {
+            incomplete = true;
+            break;
+        }
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+            incomplete = true;
+            break;
+        }
+        regions += 1;
+        uncommitted |= info.State != MEM_COMMIT;
+        let current_allocation = info.AllocationBase as usize;
+        allocations |= allocation.is_some_and(|old| old != current_allocation);
+        allocation = Some(current_allocation);
+        protections |= protection.is_some_and(|old| old != info.Protect);
+        protection = Some(info.Protect);
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= at {
+            incomplete = true;
+            break;
+        }
+        at = next;
+    }
+    for (slot, yes) in [(3, regions > 1), (4, uncommitted), (5, allocations), (6, protections), (7, incomplete)] {
+        if yes {
+            FAILED_REGIONS[slot].fetch_add(1, Relaxed);
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn record_protect_error(code: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let slot = match code {
+        487 => 0, // ERROR_INVALID_ADDRESS
+        998 => 1, // ERROR_NOACCESS
+        87 => 2,  // ERROR_INVALID_PARAMETER
+        _ => 3,
+    };
+    PROTECT_ERRORS[slot].fetch_add(1, Relaxed);
+}
+
+#[cfg(feature = "diagnostics")]
+fn record_protection(path: usize, blocks: usize, ok: bool, started: Option<std::time::Instant>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(started) = started else { return };
+    let ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+    let stats = &PROTECTION_CALLS[path];
+    stats[0].fetch_add(1, Relaxed);
+    stats[1].fetch_add(u64::from(!ok), Relaxed);
+    stats[2].fetch_add(blocks as u64, Relaxed);
+    stats[3].fetch_add(ns, Relaxed);
+    stats[4].fetch_max(ns, Relaxed);
+}
+
+#[cfg(feature = "diagnostics")]
+fn guard_profile() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_PROFILE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(feature = "diagnostics")]
+fn report_guard_holds() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !guard_profile() {
+        return;
+    }
+    for (name, stats) in ["other", "query", "protect", "write", "mapping", "fault", "publish"]
+        .into_iter().zip(&GUARD_HOLDS)
+    {
+        let [count, ns, max] = std::array::from_fn::<_, 3, _>(|i| stats[i].swap(0, Relaxed));
+        if count != 0 {
+            tracing::info!(operation = name, acquisitions = count, held_ms = ns as f64 / 1e6,
+                max_ms = max as f64 / 1e6, "guard lock holds since the last report");
+        }
+    }
+    for (name, stats) in ["protect_range", "protect_alias", "open_block"]
+        .into_iter().zip(&PROTECTION_CALLS)
+    {
+        let [calls, failed, blocks, ns, max] = std::array::from_fn::<_, 5, _>(|i| stats[i].swap(0, Relaxed));
+        if calls != 0 {
+            tracing::info!(operation = name, calls, failed, blocks, elapsed_ms = ns as f64 / 1e6,
+                max_ms = max as f64 / 1e6, "guard protection calls since the last report");
+        }
+    }
+    let [invalid_address, no_access, invalid_parameter, other] =
+        std::array::from_fn::<_, 4, _>(|i| PROTECT_ERRORS[i].swap(0, Relaxed));
+    if invalid_address + no_access + invalid_parameter + other != 0 {
+        tracing::info!(invalid_address, no_access, invalid_parameter, other,
+            "guard protect_range failures by Windows error since the last report");
+    }
+    let [seen, initial, fallback, multiple_regions, uncommitted, multiple_allocations, mixed_protection, incomplete] =
+        std::array::from_fn::<_, 8, _>(|i| FAILED_REGIONS[i].swap(0, Relaxed));
+    if seen != 0 {
+        tracing::info!(sampled = initial + fallback, seen, initial, fallback, multiple_regions,
+            uncommitted, multiple_allocations, mixed_protection, incomplete,
+            "failed guard protection region samples since the last report");
+    }
+}
+
+fn guards() -> GuardLock {
+    guards_for(GuardSite::Other)
+}
+
+fn guards_for(site: GuardSite) -> GuardLock {
+    #[cfg(feature = "diagnostics")]
+    let profile = guard_profile();
+    let inner = match GUARDS.try_lock() {
+        Ok(g) => g,
+        Err(_) => waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner())),
+    };
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = site;
+    GuardLock {
+        inner: Some(inner),
+        #[cfg(feature = "diagnostics")]
+        started: profile.then(std::time::Instant::now),
+        #[cfg(feature = "diagnostics")]
+        site,
+    }
 }
 
 /// The 4 KiB pages of title memory that what shaders wrote was put into,
@@ -1645,7 +1845,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
         && (PROTECTED.any(first, first + 1) || {
-            let g = guards_timed();
+            let g = guards_timed(GuardSite::Query);
             g.protected.contains(first) || g.absent.contains(first)
         });
     if !known && !is_view(start, end) {
@@ -1657,7 +1857,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // other thread asks about it: `ASKING`); what the runtime tells meanwhile
     // takes the block out of the set, and it is looked at as any other.
     let unsure: Vec<usize> = {
-        let g = guards_timed();
+        let g = guards_timed(GuardSite::Query);
         if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) {
             // Nothing written, mapped or new since the range was last taken.
             #[cfg(feature = "diagnostics")]
@@ -1682,7 +1882,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
     }
     let rest = rest();
-    let mut g = guards_timed();
+    let mut g = guards_timed(GuardSite::Protect);
     #[cfg(feature = "diagnostics")]
     tally(4, 1);
     for &(block, view) in &came {
@@ -1708,7 +1908,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             // Faults of the title's wait for the lock: each block is done on
             // its own, and looked at anew below.
             drop(g);
-            g = guards_timed();
+            g = guards_timed(GuardSite::Protect);
         }
         // Told as written by this, and read by the caller after.
         if BESIDE.take(block) {
@@ -1866,6 +2066,7 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
     let done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0;
     #[cfg(feature = "diagnostics")]
     {
+        record_protection(1, 1, done, guard_profile().then_some(started));
         tally(5, 1);
         tally(8, started.elapsed().as_nanos() as u64);
     }
@@ -1887,8 +2088,10 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
-    let set = |from: usize, to: usize| {
+    let set = |from: usize, to: usize, initial: bool| {
         let mut old = 0;
+        #[cfg(feature = "diagnostics")]
+        let profile = guard_profile();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         // SAFETY: title view memory; only its protection changes.
@@ -1900,6 +2103,18 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
                 &mut old,
             ) != 0
         };
+        #[cfg(feature = "diagnostics")]
+        if !done && profile {
+            // SAFETY: read immediately after the failed Windows API call.
+            let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            record_protect_error(code);
+        }
+        #[cfg(feature = "diagnostics")]
+        record_protection(0, to - from, done, profile.then_some(started));
+        #[cfg(feature = "diagnostics")]
+        let failed_call = !done;
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = initial;
         if done && !matches!(old, PAGE_READWRITE | PAGE_READONLY) {
             // What is there is not for us to guard (code, or memory the
             // title protects itself): as it was.
@@ -1911,6 +2126,9 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         {
             tally(5, (to - from) as u64);
             tally(8, started.elapsed().as_nanos() as u64);
+            if failed_call && profile {
+                inspect_failed_region(from, to, initial);
+            }
         }
         done
     };
@@ -1920,15 +2138,17 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     };
     // Ahead of the protection (`PROTECTED`).
     (from..to).for_each(|block| PROTECTED.set(block));
-    if set(from, to) {
+    if set(from, to, true) {
         note(g, from, to);
         return;
     }
     let mut uncommitted_until = from;
-    for block in from..to {
+    let mut block = from;
+    while block < to {
         // (Not one question a block of a region that is not there.)
-        if block >= uncommitted_until && set(block, block + 1) {
+        if block >= uncommitted_until && set(block, block + 1, false) {
             note(g, block, block + 1);
+            block += 1;
             continue;
         }
         PROTECTED.clear(block);
@@ -1943,6 +2163,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
                 g.held.insert(block);
             }
         }
+        block += 1;
     }
 }
 
@@ -2015,11 +2236,14 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
     }
     for &block in blocks {
         let mut old = 0;
+        #[cfg(feature = "diagnostics")]
+        let call_started = guard_profile().then(std::time::Instant::now);
         // SAFETY: a block we made read-only.
         unsafe {
-            if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
-                && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
-            {
+            let done = VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0;
+            #[cfg(feature = "diagnostics")]
+            record_protection(2, 1, done, call_started);
+            if done && !matches!(old, PAGE_READONLY | PAGE_READWRITE) {
                 // Not what we left there: the address is other memory's
                 // (code's, say), which keeps its protection.
                 VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
@@ -2041,7 +2265,7 @@ pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
-        let mut g = guards_timed();
+        let mut g = guards_timed(GuardSite::Write);
         let opened = open(&mut g, at, at.saturating_add(len));
         #[cfg(feature = "diagnostics")]
         {
@@ -2067,7 +2291,7 @@ pub struct KernelWrite(usize, usize);
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
-        let mut g = guards_timed();
+        let mut g = guards_timed(GuardSite::Write);
         open(&mut g, at, at.saturating_add(len));
         if len != 0 {
             // Nothing known of them stands while they are left alone.
@@ -2160,7 +2384,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         }
     }
     {
-        let mut g = guards();
+        let mut g = guards_for(GuardSite::Write);
         let guarded = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).count() as u64;
         if pages {
             WRITTEN[2].fetch_add(guarded, Relaxed);
@@ -2192,7 +2416,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     // since that look, relying on those that are opened here. And all
     // together: none may be writable while another is clean (who asks about
     // that one by its bits takes no lock).
-    let mut g = guards();
+    let mut g = guards_for(GuardSite::Mapping);
     let blocks: Vec<usize> =
         ranges.iter().flat_map(|&(at, n)| g.protected.range(at / BLOCK..(at + n).div_ceil(BLOCK)).collect::<Vec<_>>()).collect();
     #[cfg(feature = "diagnostics")]
@@ -2210,7 +2434,7 @@ pub fn title_memory_splitting(at: usize, len: usize) {
     if others.is_empty() {
         return;
     }
-    let mut g = guards();
+    let mut g = guards_for(GuardSite::Mapping);
     // (The view itself too: the part that stays is read-only until then. And
     // all of them told as written before the first is writable.)
     for &other in &others {
@@ -2526,7 +2750,7 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
-fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static, Guards> {
+fn title_memory_changed(at: usize, len: usize) -> GuardLock {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -2534,7 +2758,7 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
-    let mut g = guards();
+    let mut g = guards_for(GuardSite::Mapping);
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).collect();
     for block in absent {
@@ -2617,7 +2841,7 @@ pub(crate) fn install() {
             let began = std::time::Instant::now();
             // (Let go again before the next look: the runtime wants the
             // guards to end a change.)
-            let mut g = guards();
+            let mut g = guards_for(GuardSite::Fault);
             #[cfg(feature = "diagnostics")]
             let waited = began.elapsed();
             let opened = open(&mut g, at, at + 1);
@@ -2702,6 +2926,46 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn failed_region_samples_recognize_reserved_pages() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let p = unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        for value in &FAILED_REGIONS {
+            value.store(0, Relaxed);
+        }
+        inspect_failed_region(p / BLOCK, p / BLOCK + 1, true);
+        assert_eq!(FAILED_REGIONS[1].load(Relaxed), 1);
+        assert_eq!(FAILED_REGIONS[4].load(Relaxed), 1);
+        assert_eq!(FAILED_REGIONS[7].load(Relaxed), 0);
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn adjacent_guarded_blocks_open_one_at_a_time() {
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let first = p / BLOCK;
+        {
+            let mut g = guards();
+            protect_here(&mut g, first, first + 3);
+            assert!((first..first + 3).all(|b| g.protected.contains(b)));
+            #[cfg(feature = "diagnostics")]
+            let before = PROTECTION_CALLS[2][0].load(std::sync::atomic::Ordering::Relaxed);
+            unguard(&mut g, &[first, first + 1, first + 2]);
+            #[cfg(feature = "diagnostics")]
+            if guard_profile() {
+                assert_eq!(PROTECTION_CALLS[2][0].load(std::sync::atomic::Ordering::Relaxed) - before, 3);
+            }
+            assert!((first..first + 3).all(|b| !g.protected.contains(b)));
+        }
+        for i in 0..3 {
+            unsafe { ((p + i * PAGE) as *mut u8).write(i as u8 + 1) };
+        }
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
@@ -2852,6 +3116,28 @@ mod tests {
             let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
             VirtualQuery(at as *const _, &mut info, size_of_val(&info));
             info.Protect
+        }
+    }
+
+    #[test]
+    fn failed_range_fallback_protects_committed_run_before_hole() {
+        use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY, VirtualAlloc};
+        // SAFETY: reserve our own address range, then commit its first two blocks.
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 4 * BLOCK, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert_ne!(p, 0);
+            assert_eq!(VirtualAlloc(p as *const _, 2 * BLOCK, MEM_COMMIT, PAGE_READWRITE) as usize, p);
+            let first = p / BLOCK;
+            {
+                let mut g = guards();
+                protect_here(&mut g, first, first + 4);
+                assert!(g.protected.contains(first) && g.protected.contains(first + 1));
+                assert!(!g.protected.contains(first + 2));
+                assert!(g.absent.contains(first + 2));
+            }
+            assert_eq!(protection(p), PAGE_READONLY);
+            title_memory_unmapping(p, 4 * BLOCK);
+            assert_ne!(VirtualFree(p as *mut _, 0, MEM_RELEASE), 0);
         }
     }
 

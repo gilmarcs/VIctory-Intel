@@ -118,7 +118,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
+pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_host_wave_range};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -558,9 +558,40 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    // Wall time of the whole attempt chain for a wave64 program on a 32-lane host, with
+    // `VICTORY_WAVE_WHY=1`: what the retries cost per program (translation only; cached).
+    let timed = native.wave64 && lower::host_max_wave() == 32 && std::env::var_os("VICTORY_WAVE_WHY").is_some();
+    let start = std::time::Instant::now();
+    let r = emit_inner(c, native, p, st, io, res);
+    if timed {
+        eprintln!(
+            "WAVE64-TIME digest={} ms={:.1} ok={}",
+            hex_digest(&c.digest),
+            start.elapsed().as_secs_f64() * 1000.0,
+            r.is_ok()
+        );
+    }
+    r
+}
+
+fn emit_inner(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
+    // Kept at 64 lanes for LDS alone (no cross-half code): the only refusal the opt-in
+    // `VICTORY_WAVE_LDS_WIDE=1` routes through the wave-wide branches. Taken now, before the
+    // other forms below run and overwrite the refusal reason.
+    // (LDS alone, or LDS with cross-half code: the wave-wide branches are what lifts the LDS
+    // region; the exchange of the cross-half code comes after it)
+    let lds_only = matches!(&original, Ok((_, Some(64))))
+        && matches!(lower::wave64_refusal(), lower::Wave64Refusal::Lds | lower::Wave64Refusal::CrossesHalvesAndLds);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -578,10 +609,17 @@ pub fn emit(
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
+                let digest = hex_digest(&c.digest);
                 match r {
-                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
-                    Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
+                    Ok((_, wave)) => eprintln!("WAVE64-RETRY digest={digest} {what}: wave {wave:?}"),
+                    Err(e) => eprintln!("WAVE64-RETRY digest={digest} {what}: {e}"),
                 }
+            }
+            // A result the approximate forms give is taken: one line for it, always, so the
+            // programs whose waves are approximate can be listed (by digest) against the
+            // regressions seen in the runs.
+            if what.contains("APPROXIMATE") && matches!(r, Ok((_, wave)) if *wave != Some(64)) {
+                eprintln!("WAVE32-APPROXIMATE digest={} form=\"{what}\"", hex_digest(&c.digest));
             }
         };
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
@@ -654,11 +692,15 @@ pub fn emit(
                 }
             }
         }
-        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
-        // waves: this form puts group barriers inside branches and loops, and runs 121-124
-        // lost the card in a submission of two programs that had just moved to it
+        // This retry chain's wave-wide branches (`widen`) run only when one of three holds:
+        // `VICTORY_WAVE_WIDE=1`; the scene kernels named below; or `driver_loop` (no DXIL part,
+        // an ACCC part, and a divergent mask exchange, with `VICTORY_WAVE_WIDE` unset). Otherwise
+        // they are off. This form puts group barriers inside branches and loops, and runs
+        // 121-124 lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
+        // (The `LANE_MASK` fallback after this chain is different: it runs `widen` unless
+        // `VICTORY_WAVE_WIDE=0`; see the comment there.)
         let wide_option = std::env::var_os("VICTORY_WAVE_WIDE");
         // Both archived kernels use one logical wave per group and have
         // validated wave32 PSOs on RTX. Explicit policy wins.
@@ -668,7 +710,9 @@ pub fn emit(
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
             );
-        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        // (`VICTORY_WAVE_LDS_WIDE=1`: the LDS-only programs as well; see `lds_only` above)
+        let lds_wide = lds_only && std::env::var_os("VICTORY_WAVE_LDS_WIDE").is_some_and(|v| v == "1");
+        let wide_on = wide_option.as_ref().map_or(scene_kernel || lds_wide, |v| v == "1");
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
@@ -761,7 +805,9 @@ pub fn emit(
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
-    // lowering has named the skipped blocks).
+    // lowering has named the skipped blocks). Unlike the retry chain above, this one is ON by
+    // default (only `VICTORY_WAVE_WIDE=0` turns it off), and it runs only for `LANE_MASK`
+    // compute programs.
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
             if native.stage == HwStage::Cs
@@ -778,10 +824,19 @@ pub fn emit(
     };
     let supported = |(shader, wave): (HostShader, Option<u32>)| {
         if wave == Some(64) && lower::host_max_wave() == 32 {
-            Err(ShaderError::Unsupported {
-                offset: 0,
-                what: "no wave32 lowering for this wave64 program",
-            })
+            let what = match lower::wave64_refusal() {
+                lower::Wave64Refusal::CrossesHalves => {
+                    "no wave32 lowering: cross-lane code past the 32-lane halves (masks, lane reads, permutes)"
+                }
+                lower::Wave64Refusal::Lds => {
+                    "no wave32 lowering: group LDS without a barrier every thread of the group reaches"
+                }
+                lower::Wave64Refusal::CrossesHalvesAndLds => {
+                    "no wave32 lowering: cross-half code and group LDS without a barrier every thread reaches"
+                }
+                lower::Wave64Refusal::Other => "no wave32 lowering for this wave64 program",
+            };
+            Err(ShaderError::Unsupported { offset: 0, what })
         } else {
             Ok(shader)
         }
@@ -1001,11 +1056,40 @@ fn emit_program_pruned(
         prims,
         mesh_stride,
     };
+    // The refusal reason is only set by a lowering that keeps 64 lanes: clear it first, so a
+    // result of this lowering never reports the reason of an earlier one on this thread.
+    lower::set_wave64_refusal(lower::Wave64Refusal::Other);
+    let _ = lower::take_wave64_clamp();
     let l = match keep {
         Some(keep) => lower::lower_pruned(&parts, keep),
         None => lower::lower(&parts),
     }?;
+    // The vkd3d-proton clamp's verdict for a program that kept 64 lanes, by the program's digest
+    // (`VICTORY_WAVE_WHY=1`): compare these lines with the approximate ones on the same run.
+    if let Some(v) = lower::take_wave64_clamp()
+        && std::env::var_os("VICTORY_WAVE_WHY").is_some()
+    {
+        eprintln!(
+            "WAVE64-CLAMP digest={} group={} clamp_exact={} lds={} crossing={}",
+            hex_digest(&c.digest),
+            v.group,
+            v.exact,
+            v.lds,
+            v.crossing
+        );
+    }
     let wave_size = l.wave_size;
+    // A declared `WaveSize` outside the host's range fails the pipeline in the runtime. A
+    // wave64 program on a 32-lane host is left to the retries in `emit` (they look at it).
+    if let Some(w) = wave_size
+        && !(w == 64 && lower::host_max_wave() == 32)
+        && !lower::wave_fits(w)
+    {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "no lowering: the program's wave size is outside the host's wave sizes",
+        });
+    }
     let shader = HostShader {
         stage: native.stage,
         dxil: l.dxil,
@@ -1029,6 +1113,11 @@ fn emit_program_pruned(
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
+}
+
+/// A container digest as hex, for the log lines naming a program.
+fn hex_digest(digest: &[u8]) -> String {
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The title's vertex output interpolation lives in PSV0. A float packed

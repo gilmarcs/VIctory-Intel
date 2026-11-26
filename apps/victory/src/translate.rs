@@ -144,6 +144,10 @@ impl Tally {
 type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
 /// The optional checks after emission, one set per thread.
+/// Stack of each translation worker: the emitter recurses (structure, lowering), and the 2 MiB
+/// of a default spawned thread was not enough for some programs.
+const WORKER_STACK: usize = 16 << 20;
+
 struct Checks {
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
@@ -275,6 +279,10 @@ pub fn run(
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
+    // Progress on stderr (stdout is the listing): every 250 containers, the count, the
+    // seconds since the start and the file being read.
+    let started = std::time::Instant::now();
+    let done = AtomicUsize::new(0);
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
@@ -290,7 +298,11 @@ pub fn run(
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
+                    // (a translation recurses through the emitter: the default stack of a spawned
+                    // thread overflowed on some programs, which killed the worker)
+                    std::thread::Builder::new()
+                        .stack_size(WORKER_STACK)
+                        .spawn_scoped(s, || {
                         let mut t = Tally {
                             list,
                             ..Tally::default()
@@ -306,9 +318,18 @@ pub fn run(
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n % 250 == 0 {
+                                eprintln!(
+                                    "progress: {n} containers so far, {:.0} s, last file {}",
+                                    started.elapsed().as_secs_f64(),
+                                    entry.path().display()
+                                );
+                            }
                         }
                         lock(&total).merge(t);
-                    });
+                    })
+                    .expect("translation worker");
                 }
             });
         }
@@ -544,6 +565,11 @@ fn translate(
 fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
     for p in programs {
         t.programs += 1;
+        // `VICTORY_TRANSLATE_TRACE=1`: each program's name before it is translated, so a
+        // translation that dies names the program it was on.
+        if std::env::var_os("VICTORY_TRANSLATE_TRACE").is_some() {
+            eprintln!("trace: {} {:?}", example(), p.stage);
+        }
         match victory_shader::spill::build(&p) {
             Ok(program) => {
                 t.translated += 1;
