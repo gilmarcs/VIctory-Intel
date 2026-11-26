@@ -11319,13 +11319,16 @@ impl<'a> Lower<'a> {
                 let f32t = self.s.t.f32;
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
+                    // Only the coordinates the size divides go in: the validator wants the rest
+                    // undef ("out of bound coord"), and an array's slice is not one of them.
+                    let lod_coords: [V; 3] = std::array::from_fn(|k| if k < spatial { cs[k] } else { fu });
                     let lod = self.s.op(
                         c,
                         "calculateLOD.f32",
                         Attr::ReadOnly,
                         f32t,
                         81,
-                        &[h, sh, cs[0], cs[1], cs[2], clamped],
+                        &[h, sh, lod_coords[0], lod_coords[1], lod_coords[2], clamped],
                     );
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
