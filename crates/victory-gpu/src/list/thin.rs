@@ -907,6 +907,7 @@ mod tests {
         let kept = record(slot.as_ptr() as u64);
         slot[1] = 99;
         assert_eq!(kept[1], 2);
+        assert_eq!(slot[1], 99);
         assert_eq!(record(0), [0; RECORD]);
     }
 }

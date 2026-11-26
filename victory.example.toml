@@ -17,3 +17,16 @@ game_dir = 'D:\victory-data\game'
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
+
+[graphics]
+# Emulate Xbox Series S for a lighter graphics profile.
+console = 'series-s'
+# Optional host window limit; the title render target remains unchanged.
+# window_width = 1280
+# window_height = 720
+# Limit translated shader loops for weaker GPUs.
+# shader_loop_limit = 512
+# Optional frame-rate target.
+# fps = 30
+# Enable GPU timing diagnostics.
+# gpu_timing = false

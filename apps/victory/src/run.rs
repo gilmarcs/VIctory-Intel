@@ -4,6 +4,28 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+fn apply_graphics_environment(graphics: &victory_core::GraphicsConfig) {
+    let set_if_missing = |key: &str, value: String| {
+        if std::env::var_os(key).is_none() {
+            unsafe { std::env::set_var(key, value) };
+        }
+    };
+    if let (Some(width), Some(height)) = (graphics.window_width, graphics.window_height)
+        && std::env::var_os("VICTORY_WINDOW_MAX").is_none()
+    {
+        set_if_missing("VICTORY_WINDOW_MAX", format!("{width}x{height}"));
+    }
+    if let Some(limit) = graphics.shader_loop_limit {
+        set_if_missing("VICTORY_SHADER_LOOP_LIMIT", limit.to_string());
+    }
+    if let Some(fps) = graphics.fps {
+        set_if_missing("VICTORY_FPS", fps.to_string());
+    }
+    if graphics.gpu_timing {
+        set_if_missing("VICTORY_GPU_TIMING", "1".to_string());
+    }
+}
+
 #[cfg(any(windows, test))]
 const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
 
@@ -41,7 +63,7 @@ pub fn run(
     unimplemented: Unimplemented,
     strict: bool,
     execute: bool,
-    console: Console,
+    console: Option<Console>,
 ) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
@@ -53,6 +75,7 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    apply_graphics_environment(&cfg.graphics);
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -101,10 +124,16 @@ pub fn run(
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
-    victory_hle::console::set(match console {
-        Console::SeriesX => victory_hle::console::Console::SeriesX,
-        Console::SeriesS => victory_hle::console::Console::SeriesS,
-    });
+    let console = console
+        .map(|value| match value {
+            Console::SeriesX => victory_hle::console::Console::SeriesX,
+            Console::SeriesS => victory_hle::console::Console::SeriesS,
+        })
+        .unwrap_or(match cfg.graphics.console {
+            Some(victory_core::GraphicsConsole::SeriesS) => victory_hle::console::Console::SeriesS,
+            _ => victory_hle::console::Console::SeriesX,
+        });
+    victory_hle::console::set(console);
     println!("console        {}", victory_hle::console::current().name());
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {

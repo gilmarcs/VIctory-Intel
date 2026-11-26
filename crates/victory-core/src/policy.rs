@@ -45,6 +45,9 @@ pub fn ensure_outside_repo(path: &Path) -> Result<(), PolicyError> {
         && root.join(ROOT_MARKER).is_file()
         && resolved.starts_with(&root)
     {
+        if resolved.starts_with(root.join("debugs")) {
+            return Ok(());
+        }
         return Err(PolicyError::InsideRepo {
             path: path.to_path_buf(),
             root,
@@ -136,6 +139,14 @@ mod tests {
         ));
         let sneaky = std::env::temp_dir().join("..").join("x"); // sanity: no panic
         let _ = ensure_outside_repo(&sneaky);
+    }
+
+    #[test]
+    fn accepts_debug_directory() {
+        let debug = compiled_workspace_root()
+            .join("debugs")
+            .join("victory-cache");
+        ensure_outside_repo(&debug).unwrap();
     }
 
     #[test]

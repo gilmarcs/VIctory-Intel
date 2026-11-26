@@ -22,8 +22,27 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
+    pub graphics: GraphicsConfig,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GraphicsConsole {
+    #[default]
+    SeriesX,
+    SeriesS,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphicsConfig {
+    pub console: Option<GraphicsConsole>,
+    pub window_width: Option<u32>,
+    pub window_height: Option<u32>,
+    pub shader_loop_limit: Option<u32>,
+    pub fps: Option<u32>,
+    pub gpu_timing: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -31,6 +50,8 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
+    #[serde(default)]
+    graphics: FileGraphics,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -41,6 +62,18 @@ struct FilePaths {
     data_dir: Option<PathBuf>,
     #[serde(default)]
     test_titles: Vec<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileGraphics {
+    console: Option<GraphicsConsole>,
+    window_width: Option<u32>,
+    window_height: Option<u32>,
+    shader_loop_limit: Option<u32>,
+    fps: Option<u32>,
+    #[serde(default)]
+    gpu_timing: bool,
 }
 
 impl Config {
@@ -70,11 +103,14 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        Self::resolve(parsed.paths, parsed.graphics, source, |k| {
+            std::env::var_os(k)
+        })
     }
 
     fn resolve(
         file: FilePaths,
+        graphics: FileGraphics,
         source: Option<PathBuf>,
         env: impl Fn(&str) -> Option<std::ffi::OsString>,
     ) -> Result<Self> {
@@ -91,11 +127,30 @@ impl Config {
         let data_dir = env_path("VICTORY_DATA_DIR")
             .or(file.data_dir)
             .map_or_else(|| default_dir("data"), Ok)?;
+        let env_u32 = |key: &str| env(key).and_then(|v| v.to_string_lossy().parse::<u32>().ok());
+        let env_console = env("VICTORY_CONSOLE").and_then(|v| {
+            v.to_str()
+                .and_then(|value| match value.to_ascii_lowercase().as_str() {
+                    "series-s" | "seriess" => Some(GraphicsConsole::SeriesS),
+                    "series-x" | "seriesx" => Some(GraphicsConsole::SeriesX),
+                    _ => None,
+                })
+        });
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
             data_dir,
             test_titles,
+            graphics: GraphicsConfig {
+                console: env_console.or(graphics.console),
+                window_width: env_u32("VICTORY_WINDOW_WIDTH").or(graphics.window_width),
+                window_height: env_u32("VICTORY_WINDOW_HEIGHT").or(graphics.window_height),
+                shader_loop_limit: env_u32("VICTORY_SHADER_LOOP_LIMIT")
+                    .or(graphics.shader_loop_limit),
+                fps: env_u32("VICTORY_FPS").or(graphics.fps),
+                gpu_timing: env("VICTORY_GPU_TIMING").is_some_and(|v| v.to_string_lossy() == "1")
+                    || graphics.gpu_timing,
+            },
             source,
         })
     }
@@ -157,7 +212,7 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(|| OsString::from("from-env"));
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, FileGraphics::default(), None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-env"));
         assert_eq!(cfg.cache_dir, PathBuf::from("cache-from-file"));
     }
@@ -169,7 +224,7 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(OsString::new);
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, FileGraphics::default(), None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-file"));
     }
 
@@ -180,7 +235,7 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(OsString::new);
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, FileGraphics::default(), None, env).unwrap();
         assert_eq!(cfg.test_titles, vec![PathBuf::from("from-file")]);
     }
 
@@ -189,7 +244,7 @@ mod tests {
         let value = std::env::join_paths(["first", "second"]).unwrap();
         let file = FilePaths::default();
         let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(|| value.clone());
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, FileGraphics::default(), None, env).unwrap();
         assert_eq!(
             cfg.test_titles,
             vec![PathBuf::from("first"), PathBuf::from("second")]

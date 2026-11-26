@@ -40,6 +40,9 @@ Outside the repository, configured in `victory.toml`: `game_dir` (the
 user's dump), `test_titles`, and `cache_dir` for everything derived
 (default `%LOCALAPPDATA%\victory\cache`).
 
+For local debugging, `debugs/` may be used because the directory is ignored
+by Git and is the only permitted exception inside this source tree.
+
 ## Enforcement
 
 1. `.gitignore` keeps common data types out of `git status`.

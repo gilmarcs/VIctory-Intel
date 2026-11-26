@@ -49,11 +49,18 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
-        0 => SIXTIETH,
-        us => Duration::from_micros(u64::from(us)),
-    };
-    tracing::info!(?interval, "frame interval");
+    let fps = std::env::var("VICTORY_FPS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|fps| (1..=240).contains(fps));
+    let interval = fps.map_or_else(
+        || match length {
+            0 => SIXTIETH,
+            us => Duration::from_micros(u64::from(us)),
+        },
+        |fps| Duration::from_nanos(1_000_000_000 / u64::from(fps)),
+    );
+    tracing::info!(?interval, ?fps, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
