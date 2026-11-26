@@ -1706,6 +1706,10 @@ fn by_query() -> bool {
 /// A page that is committed and may not be read counts as not there, which
 /// is what the callers ask for: they read or write the memory next.
 fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
+    readable_profiled(at, len, all, None)
+}
+
+fn readable_profiled(at: usize, len: usize, all: bool, mut profile: Option<&mut MappedProfile>) -> (usize, usize) {
     use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     const KERNEL_PAGE: usize = 4096;
@@ -1721,6 +1725,7 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
             entry.VirtualAddress = ((page + i) * KERNEL_PAGE) as *mut _;
         }
         // SAFETY: `n` entries of the size given; our own process.
+        let started = profile.as_ref().map(|_| std::time::Instant::now());
         let asked = unsafe {
             K32QueryWorkingSetEx(
                 GetCurrentProcess(),
@@ -1728,12 +1733,30 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
                 (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
             )
         } != 0;
+        if let Some(p) = profile.as_deref_mut() {
+            p.working_set_calls += 1;
+            p.working_set_pages += n as u64;
+            p.working_set_failed += u64::from(!asked);
+            p.working_set_ns += started.unwrap().elapsed().as_nanos();
+        }
         for (i, entry) in info[..n].iter().enumerate() {
             // Bit 0 of the answer: the page is in the working set.
             // SAFETY: plain data the query filled in.
             let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
             let mut byte = [0u8];
-            if valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
+            let readable = if valid {
+                true
+            } else {
+                let started = profile.as_ref().map(|_| std::time::Instant::now());
+                let result = crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte);
+                if let Some(p) = profile.as_deref_mut() {
+                    p.read_calls += 1;
+                    p.read_failed += u64::from(!result);
+                    p.read_ns += started.unwrap().elapsed().as_nanos();
+                }
+                result
+            };
+            if readable {
                 there += 1;
             } else if all {
                 return (there, of);
@@ -1745,6 +1768,10 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
 }
 
 fn committed_by_query(at: *const u8, len: usize) -> bool {
+    committed_by_query_profiled(at, len, None)
+}
+
+fn committed_by_query_profiled(at: *const u8, len: usize, mut profile: Option<&mut MappedProfile>) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let mut p = at as usize;
     let end = p + len;
@@ -1752,7 +1779,13 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
+        let started = profile.as_ref().map(|_| std::time::Instant::now());
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        if let Some(p) = profile.as_deref_mut() {
+            p.virtual_calls += 1;
+            p.virtual_failed += u64::from(n == 0);
+            p.virtual_ns += started.unwrap().elapsed().as_nanos();
+        }
         if n == 0 || info.State != MEM_COMMIT {
             return false;
         }
@@ -1768,7 +1801,41 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// answer is none without a look at the pages between (two queries for the
 /// slots whose texture is away, which are asked again and again).
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    mapped_bytes_inner(at, len, None)
+}
+
+#[derive(Default)]
+pub(crate) struct MappedProfile {
+    pub views_hit: u64,
+    pub views_miss: u64,
+    pub views_wait_ns: u128,
+    pub views_search_ns: u128,
+    pub fallback_ns: u128,
+    pub endpoint_calls: u64,
+    pub endpoint_ns: u128,
+    pub endpoint_empty: u64,
+    pub block_scans: u64,
+    pub blocks: u64,
+    pub page_scans: u64,
+    pub scan_ns: u128,
+    pub query_scans: u64,
+    pub working_set_calls: u64,
+    pub working_set_pages: u64,
+    pub working_set_failed: u64,
+    pub working_set_ns: u128,
+    pub read_calls: u64,
+    pub read_failed: u64,
+    pub read_ns: u128,
+    pub virtual_calls: u64,
+    pub virtual_failed: u64,
+    pub virtual_ns: u128,
+}
+
+pub(crate) fn mapped_bytes_profiled(at: *const u8, len: usize, profile: &mut MappedProfile) -> u64 {
+    mapped_bytes_inner(at, len, Some(profile))
+}
+
+fn mapped_bytes_inner(at: *const u8, len: usize, mut profile: Option<&mut MappedProfile>) -> u64 {
     if len == 0 {
         return 0;
     }
@@ -1779,19 +1846,124 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     // 64 KiB of the texture (and once more for each that is not there).
     // `VICTORY_MAPPED_BY_VIEWS=0`: the host is asked, as before.
     static BY_VIEWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *BY_VIEWS.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_VIEWS").is_none_or(|v| v != "0"))
-        && let Some(there) = crate::inplace::shown_bytes(start, len)
-    {
-        return there;
+    if *BY_VIEWS.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_VIEWS").is_none_or(|v| v != "0")) {
+        let mut times = (0, 0);
+        let shown = if profile.is_some() {
+            crate::inplace::shown_bytes_profiled(start, len, Some(&mut times))
+        } else {
+            crate::inplace::shown_bytes(start, len)
+        };
+        if let Some(p) = profile.as_deref_mut() {
+            p.views_wait_ns += times.0;
+            p.views_search_ns += times.1;
+            p.views_hit += u64::from(shown.is_some());
+            p.views_miss += u64::from(shown.is_none());
+        }
+        if let Some(there) = shown {
+            return there;
+        }
     }
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
+    let fallback_start = profile.as_ref().map(|_| std::time::Instant::now());
+    let result = mapped_bytes_fallback(at, len, start, end, profile.as_deref_mut());
+    if let (Some(p), Some(started)) = (profile, fallback_start) {
+        p.fallback_ns += started.elapsed().as_nanos();
+    }
+    result
+}
+
+/// Experimental: ask for up to 64 representative pages at once. A failed
+/// query falls back to the original per-block path; nonresident pages still
+/// need the same safe read as the original path.
+fn mapped_blocks_batch(start: usize, end: usize, mut profile: Option<&mut MappedProfile>) -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const BLOCK: usize = 64 << 10;
+    const BATCH: usize = 64;
+    let mut block = start & !(BLOCK - 1);
+    let mut there = 0u64;
+    while block < end {
+        // SAFETY: plain zero-initialized output structures.
+        let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; BATCH] = unsafe { std::mem::zeroed() };
+        let mut ranges = [(0usize, 0usize); BATCH];
+        let mut n = 0;
+        while n < BATCH && block < end {
+            let lo = block.max(start);
+            let hi = block.saturating_add(BLOCK).min(end);
+            ranges[n] = (lo, hi);
+            info[n].VirtualAddress = (lo & !4095) as *mut _;
+            n += 1;
+            let next = block.saturating_add(BLOCK);
+            if next == block { break; }
+            block = next;
+        }
+        let began = profile.as_ref().map(|_| std::time::Instant::now());
+        // SAFETY: n initialized entries, current process.
+        let ok = unsafe {
+            K32QueryWorkingSetEx(GetCurrentProcess(), info.as_mut_ptr().cast(), (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32)
+        } != 0;
+        if let Some(p) = profile.as_deref_mut() {
+            p.blocks += n as u64;
+            p.working_set_calls += 1;
+            p.working_set_pages += n as u64;
+            p.working_set_failed += u64::from(!ok);
+            p.working_set_ns += began.unwrap().elapsed().as_nanos();
+        }
+        for (entry, (lo, hi)) in info[..n].iter().zip(ranges[..n].iter().copied()) {
+            // SAFETY: flags returned by the query, or ignored on failure.
+            let valid = ok && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+            let present = if !ok {
+                readable_profiled(lo, 1, true, profile.as_deref_mut()).0 == 1
+            } else if valid {
+                true
+            } else {
+                let started = profile.as_ref().map(|_| std::time::Instant::now());
+                let mut byte = [0u8];
+                let result = crate::host::read_into((lo & !4095) as *const u8, &mut byte);
+                if let Some(p) = profile.as_deref_mut() {
+                    p.read_calls += 1;
+                    p.read_failed += u64::from(!result);
+                    p.read_ns += started.unwrap().elapsed().as_nanos();
+                }
+                result
+            };
+            if present { there += (hi - lo) as u64; }
+        }
+    }
+    there
+}
+
+fn mapped_bytes_fallback(at: *const u8, len: usize, start: usize, end: usize, mut profile: Option<&mut MappedProfile>) -> u64 {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let started = profile.as_ref().map(|_| std::time::Instant::now());
+    let mut endpoint = |address: *const u8| {
+        if let Some(p) = profile.as_deref_mut() {
+            p.endpoint_calls += 1;
+            if by_query() {
+                committed_by_query_profiled(address, 1, Some(p))
+            } else {
+                let (there, of) = readable_profiled(address as usize, 1, true, Some(p));
+                there == of
+            }
+        } else {
+            committed(address, 1)
+        }
+    };
+    let empty = !endpoint(at) && !endpoint((end - 1) as *const u8);
+    if let Some(p) = profile.as_deref_mut() {
+        p.endpoint_ns += started.unwrap().elapsed().as_nanos();
+        p.endpoint_empty += u64::from(empty);
+    }
+    if empty {
         return 0;
     }
+    let scan_start = profile.as_ref().map(|_| std::time::Instant::now());
     if !by_query() {
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
             // By page, without the walk: whole pages, cut to the range.
-            let (there, _) = readable(start, len, false);
+            if let Some(p) = profile.as_deref_mut() { p.page_scans += 1; }
+            let (there, _) = readable_profiled(start, len, false, profile.as_deref_mut());
+            if let Some(p) = profile.as_deref_mut() { p.scan_ns += scan_start.unwrap().elapsed().as_nanos(); }
             return (there as u64 * 4096).min(len as u64);
         }
         // By 64 KiB block, one page asked of each: the title's memory is
@@ -1803,23 +1975,39 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // textures "uploaded in part" kept the pass over the heap's views at
         // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
         const BLOCK: usize = 64 << 10;
+        if let Some(p) = profile.as_deref_mut() { p.block_scans += 1; }
+        static BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *BATCH.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BLOCK_BATCH").is_some_and(|v| v == "1")) {
+            let there = mapped_blocks_batch(start, end, profile.as_deref_mut());
+            if let Some(p) = profile.as_deref_mut() { p.scan_ns += scan_start.unwrap().elapsed().as_nanos(); }
+            return there;
+        }
         let mut there = 0u64;
         let mut block = start & !(BLOCK - 1);
         while block < end {
             let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
+            if let Some(p) = profile.as_deref_mut() { p.blocks += 1; }
+            if readable_profiled(lo, 1, true, profile.as_deref_mut()).0 == 1 {
                 there += (hi - lo) as u64;
             }
             block = block.saturating_add(BLOCK);
         }
+        if let Some(p) = profile.as_deref_mut() { p.scan_ns += scan_start.unwrap().elapsed().as_nanos(); }
         return there;
     }
+    if let Some(p) = profile.as_deref_mut() { p.query_scans += 1; }
     let (mut p, mut there) = (start, 0u64);
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
+        let started = profile.as_ref().map(|_| std::time::Instant::now());
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.virtual_calls += 1;
+            profile.virtual_failed += u64::from(n == 0);
+            profile.virtual_ns += started.unwrap().elapsed().as_nanos();
+        }
         let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
         if n == 0 || next <= p {
             break;
@@ -1829,6 +2017,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         }
         p = next;
     }
+    if let Some(p) = profile.as_deref_mut() { p.scan_ns += scan_start.unwrap().elapsed().as_nanos(); }
     there
 }
 
@@ -2061,6 +2250,34 @@ mod title_memory_tests {
 mod allocation_costs {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::*;
+
+    #[test]
+    fn mapped_block_batch_matches_individual_queries() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const BLOCK: usize = 64 << 10;
+        // SAFETY: reserve our own range and commit disjoint blocks within it.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 70 * BLOCK, MEM_RESERVE, PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            for i in [0, 1, 3, 31, 64, 69] {
+                assert!(!VirtualAlloc(base.add(i * BLOCK).cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE).is_null());
+            }
+            for (offset, len) in [(0, 70 * BLOCK), (123, 4 * BLOCK + 37), (2 * BLOCK, 2 * BLOCK), (64 * BLOCK + 7, BLOCK + 13)] {
+                let start = base as usize + offset;
+                let end = start + len;
+                let mut block = start & !(BLOCK - 1);
+                let mut expected = 0;
+                while block < end {
+                    let lo = block.max(start);
+                    let hi = (block + BLOCK).min(end);
+                    if super::readable(lo, 1, true).0 == 1 { expected += (hi - lo) as u64; }
+                    block += BLOCK;
+                }
+                assert_eq!(super::mapped_blocks_batch(start, end, None), expected);
+            }
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 
     fn texture(size: u32) -> D3D12_RESOURCE_DESC {
         D3D12_RESOURCE_DESC {

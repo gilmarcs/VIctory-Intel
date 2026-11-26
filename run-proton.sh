@@ -3,15 +3,18 @@ set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 victory=${VICTORY_EXE:-"$root/target/x86_64-pc-windows-msvc/diag/victory.exe"}
-game=${1:-}
-if [[ -z $game || $game == --help || $game == -h ]]; then
-    echo "Uso: $0 /caminho/para/game_scarlett_master.exe"
+game=${1:-"/run/media/gilmar/8CEE31B4EE319802/GTA VI/GTA6.Xbox.v1.0.2.1-CYBERLEEK/game_scarlett_master.exe"}
+if [[ $game == --help || $game == -h ]]; then
+    echo "Uso: $0 [/caminho/para/game_scarlett_master.exe]"
+    echo "Sem argumento, usa o executável padrão configurado no script."
     echo "Opcional: PROTON_PATH=/caminho/para/Proton STEAM_DIR=/caminho/para/Steam"
     echo "DirectX 12: dá preferência ao DXGI do DXVK e ao D3D12 do vkd3d-proton."
-    [[ -n $game ]] && exit 0 || exit 2
+    echo "MangoHud ativado por padrão (instale com: sudo pacman -S mangohud)."
+    echo "Use MANGOHUD=0 para desativar ou MANGOHUD_CONFIG para personalizar."
+    exit 0
 fi
-if (( $# != 1 )); then
-    echo "Informe exatamente um executável do jogo." >&2
+if (( $# > 1 )); then
+    echo "Informe no máximo um executável do jogo." >&2
     exit 2
 fi
 [[ -f $victory ]] || { echo "VIctory não encontrado: $victory" >&2; exit 1; }
@@ -36,8 +39,11 @@ fi
 
 export STEAM_COMPAT_CLIENT_INSTALL_PATH=$steam_dir
 export STEAM_COMPAT_DATA_PATH=${STEAM_COMPAT_DATA_PATH:-"${XDG_DATA_HOME:-$HOME/.local/share}/cool_fox/proton"}
-# O DXGI interno do Wine não pode criar uma swap chain usando a fila
-# D3D12 do vkd3d-proton. O modo run também prepara essas DLLs no prefixo.
+# Overlay Vulkan; a instalação do MangoHud é feita no Linux, fora do prefixo.
+export MANGOHUD=${MANGOHUD:-1}
+# Em GPUs Intel, proc_vram mostra o uso do processo; vram do sistema não é suportado.
+export MANGOHUD_CONFIG=${MANGOHUD_CONFIG:-position=top-left,fps,frametime,gpu_stats,cpu_stats,ram,proc_vram}
+# O prefixo já deve ter sido preparado pelo Proton, com DXVK e vkd3d-proton.
 export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+${WINEDLLOVERRIDES};}dxgi,d3d12,d3d12core=n,b"
 # Build de diagnóstico: camada de depuração D3D12 e logs do vkd3d-proton.
 export VICTORY_D3D12_DEBUG=${VICTORY_D3D12_DEBUG:-1}
@@ -70,5 +76,5 @@ export PROTON_LOG=${PROTON_LOG:-1}
 export PROTON_LOG_DIR=${PROTON_LOG_DIR:-$log_dir}
 echo "Log: $log"
 status=0
-"$proton/proton" run "$victory" run "$windows_game" --execute 2>&1 | tee -- "$log" || status=${PIPESTATUS[0]}
+"$proton/proton" runinprefix "$victory" run "$windows_game" --execute 2>&1 | tee -- "$log" || status=${PIPESTATUS[0]}
 exit "$status"

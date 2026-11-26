@@ -452,8 +452,14 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
 /// kind). The runtime's own record of what it mapped: no question to the
 /// host.
 pub(crate) fn shown_bytes(at: usize, len: usize) -> Option<u64> {
+    shown_bytes_profiled(at, len, None)
+}
+
+pub(crate) fn shown_bytes_profiled(at: usize, len: usize, profile: Option<&mut (u128, u128)>) -> Option<u64> {
     let end = at.saturating_add(len);
+    let started = profile.as_ref().map(|_| std::time::Instant::now());
     let v = views();
+    let acquired = started.map(|_| std::time::Instant::now());
     let first = v.views.range(..=at).next_back();
     let rest = v.views.range(at.saturating_add(1)..end.max(at.saturating_add(1)));
     let (mut there, mut any) = (0u64, false);
@@ -463,6 +469,10 @@ pub(crate) fn shown_bytes(at: usize, len: usize) -> Option<u64> {
             there += (to - from) as u64;
             any = true;
         }
+    }
+    if let (Some(profile), Some(started), Some(acquired)) = (profile, started, acquired) {
+        profile.0 += acquired.duration_since(started).as_nanos();
+        profile.1 += acquired.elapsed().as_nanos();
     }
     any.then_some(there)
 }

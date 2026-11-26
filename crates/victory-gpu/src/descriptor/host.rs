@@ -1796,8 +1796,21 @@ impl HostHeap {
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+        #[cfg(feature = "diagnostics")]
+        let profile = std::env::var_os("VICTORY_TEXTURE_QUEUE_PROFILE").is_some_and(|v| v == "1");
+        #[cfg(feature = "diagnostics")]
+        let start = profile.then(std::time::Instant::now);
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+        #[cfg(feature = "diagnostics")]
+        let acquired = profile.then(std::time::Instant::now);
+        let result = (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame));
+        #[cfg(feature = "diagnostics")]
+        if let (Some(start), Some(acquired)) = (start, acquired) {
+            tracing::info!(frame, max, queued = result.1[0], due = result.1[1], selected = result.0.len(),
+                wait_ms = acquired.duration_since(start).as_secs_f64() * 1000.0,
+                held_ms = acquired.elapsed().as_secs_f64() * 1000.0, "texture queue selection profile");
+        }
+        result
     }
 
     /// A number that changes when a slot is written or made due anew, and

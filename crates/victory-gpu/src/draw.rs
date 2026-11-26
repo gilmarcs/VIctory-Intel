@@ -2662,11 +2662,36 @@ impl State {
             BAKE_SERVED.store(0, Ordering::Relaxed);
         }
         let mut served = true;
+        #[cfg(feature = "diagnostics")]
+        let profile = std::env::var_os("VICTORY_TEXTURE_QUEUE_PROFILE").is_some_and(|v| v == "1");
+        #[cfg(feature = "diagnostics")]
+        let mut mapped_seen = std::collections::HashMap::new();
+        #[cfg(feature = "diagnostics")]
+        let (mut mapped_calls, mut mapped_repeated, mut mapped_us, mut mapped_max_us) = (0u64, 0u64, 0u128, 0u128);
+        #[cfg(feature = "diagnostics")]
+        let (mut mapped_repeat_changed, mut mapped_repeat_us) = (0u64, 0u128);
+        #[cfg(feature = "diagnostics")]
+        let mut mapped_detail = crate::texture::MappedProfile::default();
+        #[cfg(feature = "diagnostics")]
+        struct ProfileEntry(Option<std::time::Instant>, u32);
+        #[cfg(feature = "diagnostics")]
+        impl Drop for ProfileEntry {
+            fn drop(&mut self) {
+                if let Some(start) = self.0 {
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    if ms >= 100.0 {
+                        tracing::info!(slot = self.1, elapsed_ms = ms, "slow texture queue entry profile");
+                    }
+                }
+            }
+        }
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 served = false;
                 break;
             }
+            #[cfg(feature = "diagnostics")]
+            let _entry = ProfileEntry(profile.then(std::time::Instant::now), index);
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -2734,7 +2759,28 @@ impl State {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let first = crate::resource::first_mip(&desc);
                 let len = crate::resource::placed_bytes_from(&resource, first).unwrap_or(1);
+                #[cfg(feature = "diagnostics")]
+                let mapped_start = profile.then(std::time::Instant::now);
+                #[cfg(feature = "diagnostics")]
+                let mapped = if profile {
+                    crate::texture::mapped_bytes_profiled(address as *const u8, len as usize, &mut mapped_detail)
+                } else {
+                    crate::texture::mapped_bytes(address as *const u8, len as usize)
+                };
+                #[cfg(not(feature = "diagnostics"))]
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                #[cfg(feature = "diagnostics")]
+                if let Some(start) = mapped_start {
+                    let us = start.elapsed().as_micros();
+                    mapped_calls += 1;
+                    if let Some(previous) = mapped_seen.insert((address, len), mapped) {
+                        mapped_repeated += 1;
+                        mapped_repeat_changed += u64::from(previous != mapped);
+                        mapped_repeat_us += us;
+                    }
+                    mapped_us += us;
+                    mapped_max_us = mapped_max_us.max(us);
+                }
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -3040,6 +3086,32 @@ impl State {
                 }
                 None => host.texture_slot_done(index, write, again),
             }
+        }
+        #[cfg(feature = "diagnostics")]
+        if profile {
+            tracing::info!(frame, baking, served, mapped_calls, mapped_repeated, mapped_repeat_changed,
+                mapped_repeat_ms = mapped_repeat_us as f64 / 1000.0,
+                views_hit = mapped_detail.views_hit, views_miss = mapped_detail.views_miss,
+                views_wait_ms = mapped_detail.views_wait_ns as f64 / 1_000_000.0,
+                views_search_ms = mapped_detail.views_search_ns as f64 / 1_000_000.0,
+                fallback_ms = mapped_detail.fallback_ns as f64 / 1_000_000.0,
+                mapped_ms = mapped_us as f64 / 1000.0, mapped_max_ms = mapped_max_us as f64 / 1000.0,
+                pass_ms = began.elapsed().as_secs_f64() * 1000.0,
+                budget_ms = span.as_secs_f64() * 1000.0, "texture queue pass profile");
+            tracing::info!(frame, baking,
+                endpoint_calls = mapped_detail.endpoint_calls, endpoint_empty = mapped_detail.endpoint_empty,
+                endpoint_ms = mapped_detail.endpoint_ns as f64 / 1_000_000.0,
+                block_scans = mapped_detail.block_scans, blocks = mapped_detail.blocks,
+                page_scans = mapped_detail.page_scans, query_scans = mapped_detail.query_scans,
+                scan_ms = mapped_detail.scan_ns as f64 / 1_000_000.0,
+                working_set_calls = mapped_detail.working_set_calls, working_set_pages = mapped_detail.working_set_pages,
+                working_set_failed = mapped_detail.working_set_failed,
+                working_set_ms = mapped_detail.working_set_ns as f64 / 1_000_000.0,
+                read_calls = mapped_detail.read_calls, read_failed = mapped_detail.read_failed,
+                read_ms = mapped_detail.read_ns as f64 / 1_000_000.0,
+                virtual_calls = mapped_detail.virtual_calls, virtual_failed = mapped_detail.virtual_failed,
+                virtual_ms = mapped_detail.virtual_ns as f64 / 1_000_000.0,
+                "texture mapped fallback profile");
         }
         if sync.is_none() && baking && served {
             BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
