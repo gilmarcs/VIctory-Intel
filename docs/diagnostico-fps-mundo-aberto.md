@@ -289,3 +289,10 @@ mundo aberto confirmado, amostras do log `run-20261126-175856.log` mostraram
 quadros de 5,6; 8,6; 8,4; 10,9; 10,0 e 7,5 segundos. São amostras esparsas,
 não uma distribuição controlada; falta a execução correspondente com lotes e
 perfil desligado.
+
+Na execução correspondente com `VICTORY_MAPPED_BLOCK_BATCH=1` e perfil da
+fila desligado (`run-20261126-180411.log`), mundo aberto confirmado, amostras
+de quadros foram 7,4; 7,4; 2,5; 6,8 e 5,6 segundos. Cargas de trabalho e
+estado de streaming variam entre execuções; as amostras são poucas e não
+comprovam ganho de FPS. A redução observada de chamadas com perfil ligado
+continua válida para aquele passe, não para o desempenho global.
