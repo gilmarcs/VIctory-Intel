@@ -1013,6 +1013,18 @@ fn emit_program_pruned(
     {
         vertex_output_interpolation(psv.data, &mut outputs)?;
     }
+    // A mesh shader's vertex outputs declare their modes in PSV0 as well.
+    if native.stage == HwStage::Ms
+        && let Some(psv) = c.part(FourCC::PSV0)
+    {
+        mesh_output_interpolation(psv.data, &mut outputs)?;
+    }
+    // The title's pixel inputs declare their modes in PSV0 too.
+    if pixel
+        && let Some(psv) = c.part(FourCC::PSV0)
+    {
+        pixel_input_interpolation(psv.data, &mut inputs)?;
+    }
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
     if pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {
@@ -1124,8 +1136,34 @@ fn hex_digest(digest: &[u8]) -> String {
 /// beside an integer can be explicitly constant, as can a float on its own.
 /// OSG1 supplies the physical rows and columns used to match both tables.
 fn vertex_output_interpolation(
-    mut data: &[u8],
+    data: &[u8],
     outputs: &mut [container::SigElement],
+) -> Result<(), ShaderError> {
+    psv_interpolation(data, outputs, 1, false)
+}
+
+/// A mesh shader's vertex outputs, from the same PSV0 table (stage 13).
+fn mesh_output_interpolation(
+    data: &[u8],
+    outputs: &mut [container::SigElement],
+) -> Result<(), ShaderError> {
+    psv_interpolation(data, outputs, 13, false)
+}
+
+/// A pixel shader's input interpolation, from the same PSV0 table (its
+/// input records come first; the stage byte is 0 for pixel shaders).
+fn pixel_input_interpolation(
+    data: &[u8],
+    inputs: &mut [container::SigElement],
+) -> Result<(), ShaderError> {
+    psv_interpolation(data, inputs, 0, true)
+}
+
+fn psv_interpolation(
+    mut data: &[u8],
+    elements: &mut [container::SigElement],
+    stage: u8,
+    pixel_inputs: bool,
 ) -> Result<(), ShaderError> {
     const TRUNCATED: ShaderError =
         ShaderError::Malformed("truncated vertex pipeline validation data");
@@ -1141,7 +1179,8 @@ fn vertex_output_interpolation(
     let info = take(&mut data, info_size)?;
     // PSVRuntimeInfo0 has no signature. PSVRuntimeInfo1 and later share
     // these stage and signature count fields.
-    if info.len() < 36 || info[24] != 1 || info[29] == 0 {
+    let none = if pixel_inputs { info[28] == 0 } else { info[29] == 0 };
+    if info.len() < 36 || info[24] != stage || none {
         return Ok(());
     }
     let resources = size(&mut data)?;
@@ -1158,8 +1197,14 @@ fn vertex_output_interpolation(
         return Err(TRUNCATED);
     }
     let count = usize::from(info[28]) + usize::from(info[29]);
-    let elements = take(&mut data, count.checked_mul(stride).ok_or(TRUNCATED)?)?;
-    for record in elements.chunks_exact(stride).skip(usize::from(info[28])) {
+    let table = take(&mut data, count.checked_mul(stride).ok_or(TRUNCATED)?)?;
+    let split = usize::from(info[28]);
+    let records: Box<dyn Iterator<Item = &[u8]>> = if pixel_inputs {
+        Box::new(table.chunks_exact(stride).take(split))
+    } else {
+        Box::new(table.chunks_exact(stride).skip(split))
+    };
+    for record in records {
         let packed = record[10];
         if packed & 0x40 == 0 {
             continue;
@@ -1169,7 +1214,7 @@ fn vertex_output_interpolation(
         }
         let first = u32::from(record[9]);
         let rows = first..first + u32::from(record[8]);
-        for output in outputs.iter_mut().filter(|e| {
+        for output in elements.iter_mut().filter(|e| {
             e.row.is_some_and(|r| rows.contains(&r))
                 && e.col == ((packed >> 4) & 3)
                 && e.cols == (packed & 15)
