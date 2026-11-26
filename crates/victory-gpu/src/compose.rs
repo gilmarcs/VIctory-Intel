@@ -29,11 +29,16 @@ float4 ps(V v) : SV_Target {
     float4 o = over.SampleLevel(smooth_, v.uv, 0);
     return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
 }
+[RootSignature(RS)]
+float4 ps_single(V v) : SV_Target {
+    return scene.SampleLevel(smooth_, v.uv, 0);
+}
 "#;
 
 pub(crate) struct Composer {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    single_pso: ID3D12PipelineState,
     views: Vec<ID3D12DescriptorHeap>,
     step: u32,
 }
@@ -66,9 +71,10 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
 
 impl Composer {
     pub(crate) fn new(host: &Host, format: DXGI_FORMAT) -> windows::core::Result<Self> {
-        let (vs, ps) = (
+        let (vs, ps, single) = (
             compile(s!("vs"), s!("vs_5_1"))?,
             compile(s!("ps"), s!("ps_5_1"))?,
+            compile(s!("ps_single"), s!("ps_5_1"))?,
         );
         // SAFETY: the blobs' own bytes, alive through the calls.
         unsafe {
@@ -76,7 +82,50 @@ impl Composer {
                 std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
             };
             let device = &host.device;
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes(&vs))?;
+            let range = D3D12_DESCRIPTOR_RANGE {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 2,
+                BaseShaderRegister: 0,
+                RegisterSpace: 0,
+                OffsetInDescriptorsFromTableStart: 0,
+            };
+            let param = D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: &range,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            };
+            let sampler = D3D12_STATIC_SAMPLER_DESC {
+                Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+                MaxLOD: f32::MAX,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+                ..Default::default()
+            };
+            let root_desc = D3D12_ROOT_SIGNATURE_DESC {
+                NumParameters: 1,
+                pParameters: &param,
+                NumStaticSamplers: 1,
+                pStaticSamplers: &sampler,
+                Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+            };
+            let mut signature = None;
+            D3D12SerializeRootSignature(
+                &root_desc,
+                D3D_ROOT_SIGNATURE_VERSION_1,
+                &mut signature,
+                None,
+            )?;
+            let signature = signature.ok_or_else(windows::core::Error::empty)?;
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes(&signature))?;
             let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
                 pShaderBytecode: b.GetBufferPointer(),
                 BytecodeLength: b.GetBufferSize(),
@@ -103,9 +152,12 @@ impl Composer {
             desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
                 D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
             let pso = device.CreateGraphicsPipelineState(&desc)?;
+            desc.PS = code(&single);
+            let single_pso = device.CreateGraphicsPipelineState(&desc)?;
             Ok(Composer {
                 root,
                 pso,
+                single_pso,
                 views: Vec::new(),
                 step: device
                     .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
@@ -122,6 +174,7 @@ impl Composer {
         slot: usize,
         list: &ID3D12GraphicsCommandList,
         planes: [(&ID3D12Resource, DXGI_FORMAT); 2],
+        single: bool,
         back: &ID3D12Resource,
         (width, height): (u32, u32),
     ) -> windows::core::Result<()> {
@@ -167,7 +220,7 @@ impl Composer {
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
             list.SetDescriptorHeaps(&[Some(views.clone())]);
             list.SetGraphicsRootSignature(&self.root);
-            list.SetPipelineState(&self.pso);
+            list.SetPipelineState(if single { &self.single_pso } else { &self.pso });
             list.SetGraphicsRootDescriptorTable(0, gpu);
             list.IASetPrimitiveTopology(
                 windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
@@ -291,6 +344,7 @@ mod tests {
                     0,
                     cmds,
                     [(&base, format), (&overlay, format)],
+                    false,
                     &output,
                     (3, 1),
                 )
