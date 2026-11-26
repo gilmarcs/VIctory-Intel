@@ -73,6 +73,8 @@ pub const DEFAULT: u32 = ALL & !WIDE;
 /// declares by flag (the validator's "flags must match usage").
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Usage {
+    /// Live derivative operations requiring validator 1.8 in compute.
+    pub derivatives: bool,
     /// A wave or quad operation.
     pub wave_ops: bool,
     /// A rasterizer ordered view.
@@ -1091,6 +1093,9 @@ impl Module {
                     continue;
                 };
                 let name = self.funcs[*f as usize].name.as_str();
+                if name.starts_with("dx.op.") {
+                    u.derivatives |= matches!(args.first().and_then(|&v| self.int_value(v)), Some(60 | 61 | 64 | 81 | 83..=86));
+                }
                 let name = name.strip_prefix("dx.op.").unwrap_or(name);
                 if name.starts_with("wave") || name.starts_with("quad") {
                     u.wave_ops = true;
