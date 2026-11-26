@@ -452,6 +452,27 @@ impl HostPipeline {
         for (s, _) in &stages {
             s.translated()?;
         }
+        let linked = if let Some(ms) = mesh
+            && victory_shader::emit::mesh_output_bytes(&ms.translated()?.host.dxil)
+                .is_some_and(|n| n > victory_shader::emit::MESH_OUTPUT_LIMIT)
+        {
+            let Some(pair) = super::translate_linked(ms, find("pixel").map(Arc::as_ref)) else {
+                return refuse("the mesh shader exceeds the 32 KiB output budget and could not be linked", shaders);
+            };
+            Some(pair)
+        } else {
+            None
+        };
+        let stages: Vec<(&Arc<Shader>, D3D12_SHADER_VISIBILITY)> = match &linked {
+            Some((ms, ps)) => {
+                let mut stages = vec![(ms, D3D12_SHADER_VISIBILITY_MESH)];
+                if let Some(ps) = ps {
+                    stages.push((ps, D3D12_SHADER_VISIBILITY_PIXEL));
+                }
+                stages
+            }
+            None => stages,
+        };
         let host = host()?;
 
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();

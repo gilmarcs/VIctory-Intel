@@ -235,6 +235,66 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     })
 }
 
+#[cfg(windows)]
+struct LinkedPair {
+    mesh: Arc<Shader>,
+    pixel: Option<Arc<Shader>>,
+}
+
+/// One translation per pair, while unrelated pairs can translate in parallel.
+#[cfg(windows)]
+pub(crate) fn translate_linked(ms: &Shader, ps: Option<&Shader>) -> Option<(Arc<Shader>, Option<Arc<Shader>>)> {
+    type Key = ([u8; 32], Option<[u8; 32]>);
+    static LINKED: Mutex<Option<HashMap<Key, Arc<OnceLock<Option<LinkedPair>>>>>> = Mutex::new(None);
+    let key = (*blake3::hash(&ms.container).as_bytes(), ps.map(|p| *blake3::hash(&p.container).as_bytes()));
+    let cell = LINKED.lock().unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new).entry(key).or_default().clone();
+    let linked = cell.get_or_init(|| {
+        let (mesh, pixel) = match victory_shader::emit::translate_linked(
+            &ms.container,
+            ps.map(|p| p.container.as_slice()),
+        ) {
+            Ok(pair) => pair,
+            Err(error) => {
+                tracing::warn!(mesh = %ms.hash, pixel = ps.map_or("none", |p| p.hash.as_str()), %error, "linked mesh/pixel translation failed");
+                return None;
+            }
+        };
+        let wrap = |original: &Shader, host: victory_shader::emit::HostShader| -> Option<Arc<Shader>> {
+            let old = original.translated()?;
+            let tables = crate::draw::TablePlan::new(&old.used, &host.root_indexed_views);
+            let translated = Translated {
+                host,
+                threads: old.threads,
+                used: old.used.clone(),
+                tables,
+                stores: old.stores,
+                stores_by_address: old.stores_by_address,
+                picks: std::sync::atomic::AtomicU8::new(old.picks.load(std::sync::atomic::Ordering::Relaxed)),
+            };
+            let cell = OnceLock::new();
+            let _ = cell.set(Some(translated));
+            Some(Arc::new(Shader {
+                stage: original.stage,
+                hash: original.hash.clone(),
+                container: original.container.clone(),
+                ambient: original.ambient,
+                translated: cell,
+            }))
+        };
+        let bytes = victory_shader::emit::mesh_output_bytes(&mesh.dxil);
+        let mesh = wrap(ms, mesh)?;
+        let pixel = match (ps, pixel) {
+            (Some(original), Some(host)) => Some(wrap(original, host)?),
+            (None, None) => None,
+            _ => return None,
+        };
+        tracing::info!(mesh = %ms.hash, pixel = ps.map_or("none", |p| p.hash.as_str()), ?bytes, "mesh and pixel linked under 32 KiB output budget");
+        Some(LinkedPair { mesh, pixel })
+    }).as_ref()?;
+    Some((linked.mesh.clone(), linked.pixel.clone()))
+}
+
 /// The compute pipelines of the console's ray-tracing structure builder
 /// (`XboxBvhBuilder.dll`; its programs are the ones with a spilled
 /// user-data table) run **all or none**. Its stages feed each other

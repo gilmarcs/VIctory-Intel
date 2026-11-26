@@ -86,8 +86,66 @@ enum Stop {
     Fail(ShaderError),
 }
 
+/// Pixel input channels indexed by uppercase semantic name and index. Masks
+/// are relative to the first component of the semantic, not to its register.
+pub(crate) type KeptOutputs = HashMap<(String, u32), u8>;
+
+/// Prune arbitrary signature elements while preserving system values.
+/// The masks are relative because the two stages may pack the same semantic
+/// at different register columns.
+pub(crate) fn prune_signature(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
+    elements.retain_mut(|e| {
+        if e.kind != 0 {
+            return true;
+        }
+        if e.row.is_none() {
+            return false;
+        }
+        let used = keep.get(&(e.name.to_ascii_uppercase(), e.index)).copied().unwrap_or(0);
+        let relative = used & ((1u8 << e.cols) - 1);
+        if relative == 0 {
+            return false;
+        }
+        let first = relative.trailing_zeros() as u8;
+        let last = 7 - relative.leading_zeros() as u8;
+        e.col += first;
+        e.cols = last - first + 1;
+        true
+    });
+}
+
+#[cfg(test)]
+mod linked_signature_tests {
+    use super::{KeptOutputs, SigElement, prune_signature};
+
+    #[test]
+    fn semantic_channels_are_relative_and_system_values_are_preserved() {
+        let element = |name: &str, kind, col, cols| SigElement {
+            name: name.into(), index: 0, kind, comp: 9, interp: 0,
+            row: Some(0), col, cols, usage: 0, half: false,
+        };
+        let mut mesh = vec![
+            element("texcoord", 0, 0, 2),
+            element("unused", 0, 2, 1),
+            element("SV_Position", 3, 0, 4),
+        ];
+        let mut pixel = vec![element("TEXCOORD", 0, 2, 2)];
+        let keep = KeptOutputs::from([(("TEXCOORD".into(), 0), 0b10)]);
+        prune_signature(&mut mesh, &keep);
+        prune_signature(&mut pixel, &keep);
+        assert_eq!(mesh.len(), 2);
+        assert_eq!((mesh[0].col, mesh[0].cols), (1, 1));
+        assert_eq!((pixel[0].col, pixel[0].cols), (3, 1));
+        assert_eq!(mesh[1].kind, 3);
+    }
+}
+
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     lower_counted(parts, counted_in_threads(parts))
+}
+
+pub(crate) fn lower_pruned(parts: &Parts, keep: &KeptOutputs) -> Result<Lowered, ShaderError> {
+    lower_counted_pruned(parts, counted_in_threads(parts), Some(keep))
 }
 
 /// Whether the title dispatches the program by a count of threads whose last
@@ -111,9 +169,13 @@ fn counted_in_threads(parts: &Parts) -> bool {
 /// at once (`shader.rs` `USER_DISPATCH_THREADS_X`; after DexNom/VIctory
 /// bc3cd4b0, which does so for two of the programs by their digests).
 pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
+    lower_counted_pruned(parts, counted, None)
+}
+
+fn lower_counted_pruned(parts: &Parts, counted: bool, keep: Option<&KeptOutputs>) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run(counted) {
+        match Lower::new(parts, &bad, keep).run(counted) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -1388,7 +1450,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, keep: Option<&KeptOutputs>) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1399,6 +1461,13 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if let Some(keep) = keep {
+            match x.native.stage {
+                HwStage::Ps => prune_signature(&mut s.inputs, keep),
+                HwStage::Ms => prune_signature(&mut s.outputs, keep),
+                _ => {}
+            }
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -1583,6 +1652,9 @@ impl<'a> Lower<'a> {
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
+            if let Some(keep) = keep {
+                prune_signature(&mut s.prims, keep);
+            }
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
             s.mesh = Some(super::shader::Mesh {
@@ -4620,7 +4692,15 @@ impl<'a> Lower<'a> {
         let fits = |m: super::shader::Mesh| {
             mesh_output_bytes(outputs, prims, m.max_vertices, m.max_primitives) <= MESH_OUTPUT_LIMIT
         };
-        if !fits(mesh) {
+        // Use the original signatures for the count decision: pruning must
+        // not change the mesh's declared vertex/primitive counts.
+        let original_bytes = mesh_output_bytes(
+            &self.x.outputs,
+            &self.x.prims,
+            mesh.max_vertices,
+            mesh.max_primitives,
+        );
+        if !fits(mesh) || original_bytes > MESH_OUTPUT_LIMIT {
             mesh.max_vertices = mesh.max_vertices.min(threads);
             mesh.max_primitives = mesh.max_primitives.min(threads);
             // shortcut: outputs past the cap even at the lane count are
@@ -10517,7 +10597,7 @@ impl<'a> Lower<'a> {
                 .find(|i| i.row == attribute.row && i.fp16)
                 .map(|i| {
                     let packs = if i.pack2 {
-                        input_packs(&self.x.native.io, &self.s.inputs)
+                        input_packs(&self.x.native.io, &self.x.inputs)
                     } else {
                         Vec::new()
                     };
@@ -10546,7 +10626,7 @@ impl<'a> Lower<'a> {
                 // per dword (`packed_half`); the host's are 32-bit floats.
                 let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
                     let src = if pack2 {
-                        packed_half(&l.s.inputs, &packs, attribute.row, h)
+                        packed_half(&l.x.inputs, &packs, attribute.row, h)
                     } else {
                         h.is_multiple_of(2).then_some((attribute.row, h / 2))
                     };
@@ -12165,7 +12245,7 @@ impl<'a> Lower<'a> {
                 for high in [false, true] {
                     let h = 2 * ch + u8::from(high);
                     let src = if pack2 {
-                        packed_half(outputs, &packs, row, h)
+                        packed_half(&self.x.outputs, &packs, row, h)
                     } else {
                         (!high).then_some((row, ch))
                     };
@@ -12408,7 +12488,7 @@ impl<'a> Lower<'a> {
                 .any(|o| o.param & 0x80 == 0 && o.usage != Usage::Other(0) && u32::from(o.row) == r)
         };
         let free: std::collections::BTreeSet<u32> = self
-            .s
+            .x
             .outputs
             .iter()
             .filter(|o| o.kind == 0)
