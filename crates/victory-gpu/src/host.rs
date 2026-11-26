@@ -1436,7 +1436,47 @@ impl PlanePass {
         // SAFETY: the root signature is inside the pixel shader; the
         // description points at live data and never releases its pointer.
         unsafe {
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+            // The layout the pixel shader declares (`RS`): one table with
+            // the SRV of register t0, serialized by the system and not read
+            // from the shader's blob, which the system refused.
+            let range = windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_RANGE {
+                RangeType: windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 1,
+                BaseShaderRegister: 0,
+                RegisterSpace: 0,
+                OffsetInDescriptorsFromTableStart: 0,
+            };
+            let parameter = windows::Win32::Graphics::Direct3D12::D3D12_ROOT_PARAMETER {
+                ParameterType: windows::Win32::Graphics::Direct3D12::D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: windows::Win32::Graphics::Direct3D12::D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: windows::Win32::Graphics::Direct3D12::D3D12_ROOT_DESCRIPTOR_TABLE {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: &range,
+                    },
+                },
+                ShaderVisibility: windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_PIXEL,
+            };
+            let rs_desc = windows::Win32::Graphics::Direct3D12::D3D12_ROOT_SIGNATURE_DESC {
+                NumParameters: 1,
+                pParameters: &parameter,
+                ..Default::default()
+            };
+            let mut blob: Option<windows::Win32::Graphics::Direct3D::ID3DBlob> = None;
+            windows::Win32::Graphics::Direct3D12::D3D12SerializeRootSignature(
+                &rs_desc,
+                windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1,
+                &mut blob,
+                None,
+            )
+            .inspect_err(|e| {
+                tracing::warn!(error = %e, steps, format = format.0, "depth plane: root signature not serialized");
+            })?;
+            let blob = blob.ok_or_else(windows::core::Error::empty)?;
+            let signature = std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+            let root: ID3D12RootSignature =
+                device.CreateRootSignature(0, signature).inspect_err(|e| {
+                    tracing::warn!(error = %e, steps, format = format.0, "depth plane: root signature refused");
+                })?;
             let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 VS: code(&vs[..]),
@@ -1463,7 +1503,10 @@ impl PlanePass {
                 },
                 ..Default::default()
             };
-            let pipeline: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc)?;
+            let pipeline: ID3D12PipelineState =
+                device.CreateGraphicsPipelineState(&desc).inspect_err(|e| {
+                    tracing::warn!(error = %e, steps, format = format.0, "depth plane: pipeline refused");
+                })?;
             Ok((root, pipeline))
         }
     }

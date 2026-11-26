@@ -52,6 +52,9 @@ export VICTORY_D3D12_DRED=${VICTORY_D3D12_DRED:-1}
 export VICTORY_WINDOW_MAX=${VICTORY_WINDOW_MAX:-1920x1080}
 # Limita as threads que traduzem shaders e criam pipelines.
 export VICTORY_PIPELINE_WORKERS=${VICTORY_PIPELINE_WORKERS:-10}
+# Atualiza texturas sem esperar a memória do título se estabilizar (o padrão do
+# código é desligado). Desligue com VICTORY_TEXTURE_NO_WAIT=0.
+export VICTORY_TEXTURE_NO_WAIT=${VICTORY_TEXTURE_NO_WAIT:-1}
 mkdir -p -- "$STEAM_COMPAT_DATA_PATH"
 windows_game="Z:${game//\//\\}"
 echo "Proton: $proton"
