@@ -23,7 +23,7 @@ const SLOW_MS: f64 = 1000.0;
 
 fn folder() -> Result<PathBuf> {
     let cfg = victory_core::Config::load()?;
-    Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
+    cfg.cache_subdir("pipelines")
 }
 
 pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {

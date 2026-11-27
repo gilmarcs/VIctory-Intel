@@ -43,13 +43,40 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
     let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
-            offset,
-            data: &data[offset..],
+        .filter_map(|offset| {
+            let tail = &data[offset..];
+            Container::parse(tail).ok()?;
+            // The validated DXBC header gives the bytecode length used for the cache key.
+            let size = u32::from_le_bytes(tail[0x18..0x1c].try_into().unwrap()) as usize;
+            Some(Source::Raw {
+                offset,
+                data: &tail[..size],
+            })
         });
     out.extend(raw);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_shader_uses_only_the_container_bytes() {
+        let mut container = [0; 0x20];
+        container[..4].copy_from_slice(b"DXBC");
+        container[0x18..0x1c].copy_from_slice(&0x20u32.to_le_bytes());
+        let mut file = b"prefix".to_vec();
+        file.extend_from_slice(&container);
+        file.extend_from_slice(b"trailing data");
+
+        let found = sources(&file);
+        assert_eq!(found.len(), 1);
+        assert!(matches!(
+            found[0],
+            Source::Raw { offset: 6, data } if data == container
+        ));
+    }
 }
 
 #[derive(Default)]
