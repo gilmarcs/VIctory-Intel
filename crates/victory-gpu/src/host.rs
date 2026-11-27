@@ -1178,6 +1178,10 @@ pub(crate) struct HostList {
     /// What its indirect executions ran, for the report of a removed device.
     #[cfg(feature = "diagnostics")]
     indirects: indirects::Shared,
+    /// The number in the list's name: its slot among the completion marks
+    /// ([`HostList::mark_done`]).
+    #[cfg(feature = "diagnostics")]
+    number: u32,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted, and after
     /// it what the clamp notes about mesh records. In memory the CPU maps.
@@ -4116,9 +4120,12 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             let indirects = indirects::Shared::default();
             #[cfg(feature = "diagnostics")]
-            if dred_on() || dred_light() {
+            let number = {
                 static NUMBER: AtomicU32 = AtomicU32::new(0);
-                let number = NUMBER.fetch_add(1, Ordering::Relaxed);
+                NUMBER.fetch_add(1, Ordering::Relaxed)
+            };
+            #[cfg(feature = "diagnostics")]
+            if dred_on() || dred_light() {
                 name(&list, || format!("victory host list {number}"));
                 let mut all = LIST_NOTES.lock().unwrap_or_else(|e| e.into_inner());
                 if number.is_multiple_of(256) {
@@ -4144,6 +4151,8 @@ impl Host {
                 pipelines,
                 #[cfg(feature = "diagnostics")]
                 indirects,
+                #[cfg(feature = "diagnostics")]
+                number,
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
@@ -6101,7 +6110,7 @@ impl Host {
                     let bound = run.map(|r| r.pipelines.clone()).or_else(|| by_name.as_ref().and_then(|b| b.1.clone()));
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
-                    let markers: Vec<(u32, String)> = noted.map_or_else(Vec::new, |notes| {
+                    let markers: Vec<(u32, String)> = noted.clone().map_or_else(Vec::new, |notes| {
                         let notes = notes.lock().unwrap_or_else(|e| e.into_inner());
                         history
                             .iter()
@@ -6120,6 +6129,11 @@ impl Host {
                     let _ = fault_va;
                     if done > 0 {
                         text.push_str(&in_flight(history, &markers, done as usize));
+                        text.push_str(&before_stop(history, &markers, done as usize));
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    if let (Some(n), Some(notes)) = (list_number(&named), noted.as_ref()) {
+                        text.push_str(&mark_report(n, notes));
                     }
                     #[cfg(feature = "diagnostics")]
                     if let Some(indirects) = indirects {
@@ -6847,6 +6861,7 @@ impl HostList {
             }
             let what = what();
             crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
+            self.mark_done(at);
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
             // SAFETY: an open list; the marker is copied when recorded.
@@ -6859,6 +6874,27 @@ impl HostList {
                 .push((what, range));
             crate::copystat::add(crate::copystat::C::NoteNs, started.elapsed().as_nanos() as u64);
         }
+    }
+
+    /// With `VICTORY_MARK_DONE=1`: before note `at`, a write of `at + 1` to the list's slot
+    /// among the completion marks, once every command before it has finished
+    /// (`MARKER_OUT`). The device-removed report reads the slot: the breadcrumbs
+    /// may name a command after the one the card is held by, the marks do not.
+    #[cfg(feature = "diagnostics")]
+    fn mark_done(&self, at: u32) {
+        let Some(&(_, va, _)) = mark_buffer() else {
+            return;
+        };
+        let Ok(list2) = self.list.cast::<ID3D12GraphicsCommandList2>() else {
+            return;
+        };
+        let param = D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+            Dest: va + 4 * u64::from(self.number % MARK_SLOTS),
+            Value: at + 1,
+        };
+        let mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+        // SAFETY: an open list; the buffer is ours, in the copy-destination state for good.
+        unsafe { list2.WriteBufferImmediate(1, &param, Some(&mode)) };
     }
 
     /// Whether nothing recorded since the list was opened does any work:
@@ -9872,6 +9908,127 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
             .and_then(|m| markers.iter().find(|(at, _)| *at as usize == m))
             .map_or("no marker", |(_, s)| s.as_str());
         text.push_str(&format!("; command {i} (op {}): {marker}", op.0));
+    }
+    text
+}
+
+/// Slots of completion marks, one dword per list number ([`HostList::mark_done`]).
+#[cfg(feature = "diagnostics")]
+const MARK_SLOTS: u32 = 4096;
+
+/// The buffer of completion marks (`VICTORY_MARK_DONE=1`): a readback buffer the card writes
+/// and the CPU reads, its address and its mapping. `None`: off, or not made.
+#[cfg(feature = "diagnostics")]
+fn mark_buffer() -> Option<&'static (ID3D12Resource, u64, usize)> {
+    static BUFFER: OnceLock<Option<(ID3D12Resource, u64, usize)>> = OnceLock::new();
+    BUFFER
+        .get_or_init(|| {
+            if !crate::switch::on("VICTORY_MARK_DONE") || !dred_on() {
+                return None;
+            }
+            let device = &host()?.device;
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: u64::from(MARK_SLOTS) * 4,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain creation and mapping of a readback buffer.
+            let made = unsafe {
+                device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut buffer,
+                    )
+                    .and_then(|()| {
+                        let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                        b.Map(0, None, Some(&mut data))
+                    })
+            };
+            let buffer = buffer.filter(|_| made.is_ok() && !data.is_null())?;
+            // SAFETY: a live buffer.
+            let va = unsafe { buffer.GetGPUVirtualAddress() };
+            tracing::info!("completion marks on (VICTORY_MARK_DONE=1): each noted command waits for the ones before it");
+            Some((buffer, va, data as usize))
+        })
+        .as_ref()
+}
+
+/// For the report of a removed device: what the completion marks say of list `number`.
+#[cfg(feature = "diagnostics")]
+fn mark_report(number: u32, notes: &Mutex<Vec<Note>>) -> String {
+    let Some(&(_, _, data)) = mark_buffer() else {
+        return String::new();
+    };
+    // SAFETY: the mapped slot of a readback buffer that lives as long as the process.
+    let value = unsafe { std::ptr::read_volatile((data as *const u32).add((number % MARK_SLOTS) as usize)) };
+    let notes = notes.lock().unwrap_or_else(|e| e.into_inner());
+    let first = value.saturating_sub(1);
+    let mut text = format!("; completion mark of list {number}: {value} (every command before note {first} had finished)");
+    for k in first..first + 3 {
+        if let Some((what, _)) = notes.get(k as usize) {
+            text.push_str(&format!("; note {k}: {}", what.chars().take(300).collect::<String>()));
+        }
+    }
+    text
+}
+
+/// The name of a breadcrumb operation, for the commands before a stopped one.
+fn op_name(op: D3D12_AUTO_BREADCRUMB_OP) -> String {
+    match op.0 {
+        0 => "marker".into(),
+        3 => "draw".into(),
+        4 => "draw indexed".into(),
+        5 => "execute indirect".into(),
+        6 => "dispatch".into(),
+        7 => "copy buffer".into(),
+        8 => "copy texture".into(),
+        9 => "copy resource".into(),
+        12 => "clear render target".into(),
+        13 => "clear unordered access".into(),
+        14 => "clear depth".into(),
+        15 => "barrier".into(),
+        18 => "resolve query".into(),
+        26 => "write buffer immediate".into(),
+        42 => "dispatch mesh".into(),
+        45 => "barrier (enhanced)".into(),
+        46 => "begin list".into(),
+        n => format!("op {n}"),
+    }
+}
+
+/// The commands before the one a list stopped at (`done`), by name, with the note the
+/// title's command carries where there is one: the GPU may be held by work that came
+/// well before the command it is reported at, past several barriers.
+fn before_stop(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], done: usize) -> String {
+    const SHOWN: usize = 40;
+    let from = done.saturating_sub(SHOWN);
+    let mut text = format!("; the {} commands before it:", done - from);
+    for i in from..done.min(history.len()) {
+        let op = history[i];
+        if op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER {
+            continue;
+        }
+        let note = i
+            .checked_sub(1)
+            .filter(|&m| history[m] == D3D12_AUTO_BREADCRUMB_OP_SETMARKER)
+            .and_then(|m| markers.iter().find(|(at, _)| *at as usize == m))
+            .map(|(_, s)| s.chars().take(160).collect::<String>());
+        match note {
+            Some(note) => text.push_str(&format!(" [{i} {}: {note}]", op_name(op))),
+            None => text.push_str(&format!(" [{i} {}]", op_name(op))),
+        }
     }
     text
 }

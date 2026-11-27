@@ -79,6 +79,13 @@ fn now() -> u64 {
     crate::host::now_ms()
 }
 
+/// Whether small textures may lie at multiples of 4 KiB (`VICTORY_SMALL_PLACEMENT=0`: every
+/// texture at 64 KiB, as a diagnostic for copies into small placed textures).
+pub(crate) fn small_placement() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SMALL_PLACEMENT").is_none_or(|v| v != "0"))
+}
+
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_POOL").is_none_or(|v| v != "0"))
@@ -494,6 +501,31 @@ fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
     }
 }
 
+/// Where the textures cut from blocks lie, by the address of the resource: the block's heap,
+/// the piece's start and length, the block's number and when it was made (diagnostics).
+#[cfg(feature = "diagnostics")]
+#[allow(clippy::type_complexity)]
+static PLACED: Mutex<std::collections::BTreeMap<usize, (usize, u64, u64, usize, u64, u64, u32)>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// How many textures were cut from each block's heap so far (diagnostics).
+#[cfg(feature = "diagnostics")]
+static BLOCK_USES: Mutex<std::collections::BTreeMap<usize, u32>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// For the report of a copy that hung the card: where the texture at `raw` lies.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn placed_at(raw: usize) -> String {
+    match PLACED.lock().unwrap_or_else(|e| e.into_inner()).get(&raw) {
+        Some(&(heap, start, len, block, made, since, nth)) => format!(
+            "block {block} heap {heap:#x} piece {start:#x}+{len:#x} (piece {} KiB in, texture made {:.1} s ago, block made {:.1} s ago, texture {nth} cut from it)",
+            start >> 10,
+            now().saturating_sub(made) as f64 / 1e3,
+            now().saturating_sub(since) as f64 / 1e3
+        ),
+        None => "not cut from a block".into(),
+    }
+}
+
 /// A texture of `desc` (no target, depth or unordered access) in a block;
 /// `None`: not pooled, or the host refused.
 ///
@@ -514,7 +546,7 @@ pub(crate) unsafe fn texture(
     d.Alignment = u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT);
     // SAFETY: plain queries.
     let mut info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
-    if info.SizeInBytes == u64::MAX || info.Alignment != d.Alignment {
+    if !small_placement() || info.SizeInBytes == u64::MAX || info.Alignment != d.Alignment {
         d.Alignment = 0;
         info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
     }
@@ -554,6 +586,17 @@ pub(crate) unsafe fn texture(
             made_now(&made);
             #[cfg(feature = "diagnostics")]
             {
+                {
+                    // How old the block is, and how many textures were cut from it before this.
+                    let age = lock(&TEXTURES).blocks.get(piece.block).and_then(Option::as_ref).map_or(0, |b| b.since);
+                    let mut uses = BLOCK_USES.lock().unwrap_or_else(|e| e.into_inner());
+                    let n = uses.entry(heap.as_raw() as usize).or_insert(0);
+                    *n += 1;
+                    PLACED.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                        made.as_raw() as usize,
+                        (heap.as_raw() as usize, piece.start, piece.len, piece.block, now(), age, *n),
+                    );
+                }
                 crate::book::made(&made, || "a texture in a block".into());
                 crate::book::block(&heap, &made, piece.start, BLOCK);
                 crate::book::note(made.as_raw() as usize, || {

@@ -891,9 +891,42 @@ fn record_upload(
 ) {
     use std::sync::atomic::Ordering::Relaxed;
     const COPY_DEST: u32 = 0x400;
+    // Diagnostics: `VICTORY_SKIP_UPLOAD=<width>x<height>:<format>,...` drops the uploads of
+    // textures of those sizes and formats (the title's memory is not copied to them).
+    #[cfg(feature = "diagnostics")]
+    {
+        static SKIP: std::sync::OnceLock<Vec<(u64, u32, i32)>> = std::sync::OnceLock::new();
+        let skip = SKIP.get_or_init(|| {
+            std::env::var("VICTORY_SKIP_UPLOAD")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|one| {
+                    let (size, format) = one.trim().split_once(':')?;
+                    let (w, h) = size.split_once('x')?;
+                    Some((w.parse().ok()?, h.parse().ok()?, format.parse().ok()?))
+                })
+                .collect()
+        });
+        if !skip.is_empty() {
+            // SAFETY: a live resource.
+            let d = unsafe { texture.GetDesc() };
+            if skip.contains(&(d.Width, d.Height, d.Format.0)) {
+                // (so a run says whether the selector ever fired)
+                static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = SKIPPED.fetch_add(1, Relaxed) + 1;
+                if n == 1 || n.is_multiple_of(100) {
+                    tracing::info!(n, width = d.Width, height = d.Height, format = d.Format.0, "VICTORY_SKIP_UPLOAD: uploads dropped so far");
+                }
+                return;
+            }
+        }
+    }
     // A texture cut from a block may lie where another did: what the card
     // holds of that one is done with before the first upload into this one.
-    if crate::pool::on() && !staging.uploaded.load(Relaxed) {
+    // (`VICTORY_NO_ALIAS_BARRIER=1`: not recorded, as a diagnostic of copies that hang the card)
+    static NO_BARRIER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let no_barrier = *NO_BARRIER.get_or_init(|| std::env::var_os("VICTORY_NO_ALIAS_BARRIER").is_some_and(|v| v == "1"));
+    if crate::pool::on() && !staging.uploaded.load(Relaxed) && !no_barrier {
         let aliasing = D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -919,8 +952,22 @@ fn record_upload(
             let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
             list.note_read(
                 || {
+                    // How often this texture was uploaded before, and where it lies.
+                    static TIMES: std::sync::Mutex<std::collections::BTreeMap<usize, u32>> =
+                        std::sync::Mutex::new(std::collections::BTreeMap::new());
+                    let times = {
+                        let mut all = TIMES.lock().unwrap_or_else(|e| e.into_inner());
+                        let n = all.entry(windows::core::Interface::as_raw(texture) as usize).or_insert(0);
+                        *n += 1;
+                        *n
+                    };
+                    let lies = crate::pool::placed_at(windows::core::Interface::as_raw(texture) as usize);
                     format!(
-                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
+                        "texture upload {resource:?} (upload {times} of it, first of the list: {}, {lies}; layout {} flags {:#x} align {:#x}) ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
+                        !staging.uploaded.load(Relaxed),
+                        d.Layout.0,
+                        d.Flags.0,
+                        d.Alignment,
                         d.Width,
                         d.Height,
                         d.DepthOrArraySize,
