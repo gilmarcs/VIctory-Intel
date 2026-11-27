@@ -635,3 +635,48 @@ Próxima ação se a investigação continuar para além da localização: gerar
 correta para Ms/Ps (ou recusar esses shaders wave64 de forma explícita), repetir o controle
 completo e verificar se o primeiro frame grande desenha corretamente. Não ligar uma aproximação
 por padrão sem conferir a semântica dos wave ops e a imagem.
+
+### Contraprova da segunda variante AlphaPrepass (2026-11-27)
+
+Na execução `configured-keep12-skip-aa017`, foram combinados
+`VICTORY_MESH_TEST=keep:1:2` e `VICTORY_SKIP_PIPELINES=aa017fca6b1feb21`. O filtro registrou
+11 linhas de descartes de `aa017`; o log terminou após 3 min 17 s com 2.823 `first bind`, 34
+linhas de FPS, FPS recente entre 0,8 e 1,1 e sem `DXGI_ERROR_DEVICE_HUNG`. O usuário informou
+que fechou o jogo manualmente. A captura de controle `configured-keep-aa017-21`, com o mesmo
+filtro mesh e `aa017` ativo, terminou em TDR após 1.789 binds e tinha o par
+`aa017 / c2c7` na janela DRED.
+
+Esse par passa a ter uma contraprova direta no fluxo filtrado: ativo reproduz o TDR; omitido,
+o TDR não ocorre durante mais de 250 s, com o título continuando a reportar frames. A tela desse
+filtro não é uma validação visual do jogo completo. Junto com a contraprova e135 já registrada,
+o nexo com os pares wave64 AlphaPrepass fica forte; a captura completa ainda pode envolver outras
+variantes da mesma família.
+
+### Limite de wave ops em mesh (2026-11-27)
+
+Leitura estática de `emit/lower.rs` mostra que mesh não herda o caminho de adaptação wave64
+implementado para compute. O índice plano de mesh vira `flattenedThreadIdInGroup`; o índice
+de lane lógico é `flat & (wave_size - 1)`. Porém, `cross_lane()` recusa operações entre lanes
+em mesh porque SM 6.6 não permite declarar wave size para mesh. Reduções sem máscara só aceitam
+min/max, explicitamente limitadas à wave física do host; soma, prefixo, operações de máscara e
+outras reduções são recusadas. Isso afasta a hipótese de que o DXIL emitido esteja usando
+diretamente uma wave DXIL de 64 lanes, mas deixa uma lacuna semântica possível: reduções min/max
+de um shader wave64 são executadas por wave física (16–32 lanes), não pela wave lógica completa.
+
+Ainda não foi demonstrado que essa lacuna afeta `e135` ou `aa017`: o census registra presença
+de operações wave, mas precisamos mapear cada operação nativa dos dois shaders e o resultado
+DXIL correspondente. A correlação do hang com os pares AlphaPrepass continua sendo evidência
+de runtime; a captura de `aa017` com pipeline omitida é censurada pelo fechamento manual do
+usuário e não deve ser descrita como execução concluída sem hang.
+
+O mapeamento do caso `e135` agora confirma uma incompatibilidade mais específica. Os cinco
+`v_readfirstlane_b32` do shader aparecem no DXIL como cinco `dx.op.waveReadLaneFirst.i32`. A
+segunda variante `aa017` também tem nove `v_readfirstlane_b32` no código nativo e 9 `wave_op`
+no census (o c2c7 tem 15). O lowering de mesh chama `first_lane()`, que usa a wave física DXIL. O intercâmbio entre duas
+metades de 32 lanes só é gerado quando `exchange` existe; essa adaptação é preparada dentro do
+caminho de compute (`StageIo::Cs`). Portanto, se o operando varia entre lanes 0–31 e 32–63, as
+duas metades do host leem valores diferentes, enquanto a wave64 do console escolhe um único
+primeiro lane. Isso demonstra divergência semântica possível no shader emitido, mas ainda não
+prova que esse operando varia nos pontos correspondentes nem que a divergência é a causa direta
+do TDR. Para `aa017`, temos o disassembly nativo, mas ainda não uma listagem DXIL emitida que
+permita casar cada um dos nove pontos.
