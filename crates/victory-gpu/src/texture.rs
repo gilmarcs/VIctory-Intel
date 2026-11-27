@@ -274,6 +274,14 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
+    // (`VICTORY_SKIP_ALIAS_COPY=1`: no copy through a buffer, as a diagnostic of copies that hang the card)
+    #[cfg(feature = "diagnostics")]
+    {
+        static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *SKIP.get_or_init(|| std::env::var_os("VICTORY_SKIP_ALIAS_COPY").is_some_and(|v| v == "1")) {
+            return true;
+        }
+    }
     let first = list.first_use(placed as usize);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
@@ -896,6 +904,13 @@ fn record_upload(
     #[cfg(feature = "diagnostics")]
     {
         static SKIP: std::sync::OnceLock<Vec<(u64, u32, i32)>> = std::sync::OnceLock::new();
+        static SKIP_ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let skip_all = *SKIP_ALL.get_or_init(|| {
+            std::env::var("VICTORY_SKIP_UPLOAD")
+                .unwrap_or_default()
+                .split(',')
+                .any(|one| one.trim().eq_ignore_ascii_case("all"))
+        });
         let skip = SKIP.get_or_init(|| {
             std::env::var("VICTORY_SKIP_UPLOAD")
                 .unwrap_or_default()
@@ -907,10 +922,10 @@ fn record_upload(
                 })
                 .collect()
         });
-        if !skip.is_empty() {
+        if skip_all || !skip.is_empty() {
             // SAFETY: a live resource.
             let d = unsafe { texture.GetDesc() };
-            if skip.contains(&(d.Width, d.Height, d.Format.0)) {
+            if skip_all || skip.contains(&(d.Width, d.Height, d.Format.0)) {
                 // (so a run says whether the selector ever fired)
                 static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let n = SKIPPED.fetch_add(1, Relaxed) + 1;

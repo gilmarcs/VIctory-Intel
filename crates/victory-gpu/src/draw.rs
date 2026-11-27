@@ -1459,6 +1459,8 @@ impl State {
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -3363,6 +3365,15 @@ impl State {
         let _ = write!(text, " tables {:?}", self.reads(compute));
         if !compute && !list_slots().is_empty() {
             text.push_str(&self.slots_text());
+        }
+        #[cfg(feature = "diagnostics")]
+        if compute
+            && std::env::var_os("VICTORY_TRACE_UAV_SHADER").is_some_and(|wanted| {
+                let wanted = wanted.to_string_lossy();
+                p.stages.iter().any(|stage| stage.shader.hash.starts_with(wanted.as_ref()))
+            })
+        {
+            tracing::info!(target: "victory_gpu::indirect_trace", detail = %text, "compute bindings");
         }
         text
     }

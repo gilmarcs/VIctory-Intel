@@ -1,6 +1,7 @@
-//! A synthetic version of the upload that hangs the host GPU in the game: many copies of a
-//! small texture (16x4, R16G16B16A16_FLOAT, 896 bytes from an upload buffer at a multiple of
-//! 512) into placed textures, in command lists with many such copies and barriers.
+//! A synthetic version of the texture upload path: many copies from an upload buffer into
+//! placed textures, in command lists with resource barriers. By default this uses the small
+//! 16x4, R16G16B16A16_FLOAT texture; `SYNTH_TEXTURE=WxH:FORMAT` selects another shape, and
+//! `SYNTH_COPIES_PER_LIST` selects the number of copies per command list.
 //!
 //! `cargo run -p victory-gpu --example synth_upload -- <scenario> [iterations]`
 //!
@@ -301,9 +302,151 @@ unsafe fn persist(
     println!("persist: OK, {lists} lists of {ROUNDS} rounds of {N} copies and reads");
 }
 
+/// The game's cross-format alias path: texture -> buffer -> texture.
+unsafe fn alias_copy(
+    gpu: &mut Gpu,
+    device: &ID3D12Device,
+    allocator: &ID3D12CommandAllocator,
+    list: &ID3D12GraphicsCommandList,
+    upload: &ID3D12Resource,
+    width: u64,
+    height: u32,
+    source_format: DXGI_FORMAT,
+    destination_format: DXGI_FORMAT,
+    iterations: u32,
+    copies_per_list: u32,
+) {
+    let source_desc = texture_desc(width, height, source_format, 0);
+    let destination_desc = texture_desc(width, height, destination_format, 0);
+    let mut source_footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+    let mut destination_footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+    let (mut source_rows, mut destination_rows) = (0u32, 0u32);
+    let (mut source_bytes, mut destination_bytes) = (0u64, 0u64);
+    device.GetCopyableFootprints(&source_desc, 0, 1, 0, Some(&mut source_footprint), Some(&mut source_rows), None, Some(&mut source_bytes));
+    device.GetCopyableFootprints(&destination_desc, 0, 1, 0, Some(&mut destination_footprint), Some(&mut destination_rows), None, Some(&mut destination_bytes));
+    let a = source_footprint.Footprint;
+    let b = destination_footprint.Footprint;
+    if source_bytes != destination_bytes
+        || source_footprint.Offset != destination_footprint.Offset
+        || source_rows != destination_rows
+        || (a.Width, a.Height, a.Depth, a.RowPitch) != (b.Width, b.Height, b.Depth, b.RowPitch)
+    {
+        panic!("alias footprints differ: source {source_footprint:?} rows={source_rows} bytes={source_bytes}; destination {destination_footprint:?} rows={destination_rows} bytes={destination_bytes}");
+    }
+    eprintln!("alias footprints match: {}x{} f{} -> f{}, pitch {} rows {} total {}", width, height, source_format.0, destination_format.0, a.RowPitch, source_rows, source_bytes);
+
+    let source_allocation = device.GetResourceAllocationInfo(0, &[source_desc]);
+    let destination_allocation = device.GetResourceAllocationInfo(0, &[destination_desc]);
+    let destination_offset = source_allocation.SizeInBytes.next_multiple_of(destination_allocation.Alignment);
+    let mut heap: Option<ID3D12Heap> = None;
+    device.CreateHeap(&D3D12_HEAP_DESC {
+        SizeInBytes: destination_offset + destination_allocation.SizeInBytes,
+        Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+        Alignment: 65536,
+        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+        ..Default::default()
+    }, &mut heap).unwrap();
+    let heap = heap.unwrap();
+    let mut source = None;
+    device.CreatePlacedResource(&heap, 0, &source_desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut source).unwrap();
+    let source = source.unwrap();
+    let mut destination = None;
+    device.CreatePlacedResource(&heap, destination_offset, &destination_desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut destination).unwrap();
+    let destination = destination.unwrap();
+    let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+    let mut through: Option<ID3D12Resource> = None;
+    device.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &buffer_desc(source_bytes), D3D12_RESOURCE_STATE_COMMON, None, &mut through).unwrap();
+    let through = through.unwrap();
+    let texture_location = |resource: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+        pResource: std::mem::transmute_copy(resource),
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+    };
+
+    // Populate the source texture once, then leave it in COPY_SOURCE.
+    allocator.Reset().unwrap();
+    list.Reset(allocator, None).unwrap();
+    let from = D3D12_TEXTURE_COPY_LOCATION {
+        pResource: std::mem::transmute_copy(upload),
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: source_footprint },
+    };
+    list.CopyTextureRegion(&texture_location(&source), 0, 0, 0, &from, None);
+    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+            pResource: std::mem::transmute_copy(&source), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            StateBefore: D3D12_RESOURCE_STATE_COPY_DEST, StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+        }) },
+    }]);
+    list.Close().unwrap();
+    gpu.run(list).unwrap();
+
+    for iteration in 0..iterations {
+        allocator.Reset().unwrap();
+        list.Reset(allocator, None).unwrap();
+        for _ in 0..copies_per_list {
+            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: std::mem::transmute_copy(&through), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: D3D12_RESOURCE_STATE_COMMON, StateAfter: D3D12_RESOURCE_STATE_COPY_DEST,
+                }) },
+            }]);
+            list.CopyTextureRegion(&D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&through),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: source_footprint },
+            }, 0, 0, 0, &texture_location(&source), None);
+            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: std::mem::transmute_copy(&through), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: D3D12_RESOURCE_STATE_COPY_DEST, StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                }) },
+            }]);
+            list.CopyTextureRegion(&texture_location(&destination), 0, 0, 0, &D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&through),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: destination_footprint },
+            }, None);
+            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: std::mem::transmute_copy(&through), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: D3D12_RESOURCE_STATE_COPY_SOURCE, StateAfter: D3D12_RESOURCE_STATE_COMMON,
+                }) },
+            }]);
+        }
+        list.Close().unwrap();
+        if let Err(why) = gpu.run(list) {
+            println!("alias: HANG at list {iteration}: {why}");
+            std::process::exit(2);
+        }
+        if iteration % 200 == 0 { eprintln!("alias: {iteration} lists done"); }
+    }
+    println!("alias: OK, {iterations} lists of {copies_per_list} texture-buffer-texture copies");
+}
+
 fn main() {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "placed4".into());
     let iterations: u32 = std::env::args().nth(2).and_then(|n| n.parse().ok()).unwrap_or(2000);
+    let copies_per_list: u32 = std::env::var("SYNTH_COPIES_PER_LIST")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(COPIES_PER_LIST);
+    let (width, height, format) = std::env::var("SYNTH_TEXTURE")
+        .ok()
+        .and_then(|s| {
+            let (size, format) = s.split_once(':')?;
+            let (width, height) = size.split_once('x')?;
+            Some((width.parse().ok()?, height.parse().ok()?, DXGI_FORMAT(format.parse().ok()?)))
+        })
+        .unwrap_or((16, 4, DXGI_FORMAT_R16G16B16A16_FLOAT));
     // SAFETY: plain D3D12 calls on objects made here.
     unsafe {
         if std::env::var_os("SYNTH_DEBUG").is_some() {
@@ -312,7 +455,7 @@ fn main() {
             layer.unwrap().EnableDebugLayer();
         }
         let (device, name) = adapter_device();
-        eprintln!("using {name}, scenario {scenario}, {iterations} lists of {COPIES_PER_LIST} copies");
+        eprintln!("using {name}, scenario {scenario}, {iterations} lists of {copies_per_list} copies ({width}x{height} f{})", format.0);
         let queue: ID3D12CommandQueue = device
             .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
             .unwrap();
@@ -346,10 +489,18 @@ fn main() {
         upload.Map(0, None, Some(&mut data)).unwrap();
         std::ptr::write_bytes(data.cast::<u8>(), 0x3c, BLOCK as usize);
 
-        // Where the copies go: a heap of small slots.
+        // Where the copies go: a heap of slots sized for the selected texture.
         let small = scenario == "placed4" || scenario == "churn";
-        let slot: u64 = if small { 4096 } else { 65536 };
-        let slots = 4096u64;
+        let small_alignment = if small { u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT) } else { 0 };
+        let mut allocation_probe = texture_desc(width, height, format, small_alignment);
+        let mut allocation = device.GetResourceAllocationInfo(0, &[allocation_probe]);
+        if allocation.SizeInBytes == u64::MAX || (small && allocation.Alignment != small_alignment) {
+            allocation_probe.Alignment = 0;
+            allocation = device.GetResourceAllocationInfo(0, &[allocation_probe]);
+        }
+        let slot_alignment = if small && allocation.Alignment == small_alignment { small_alignment } else { 65536 };
+        let slot = allocation.SizeInBytes.next_multiple_of(slot_alignment);
+        let slots = if slot > 65536 { u64::from(copies_per_list.max(64)).next_power_of_two() } else { 4096 };
         let heap_desc = D3D12_HEAP_DESC {
             SizeInBytes: slot * slots,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -362,10 +513,9 @@ fn main() {
         let aliasing = std::env::var_os("SYNTH_NO_ALIASING").is_none();
 
         let default_props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
-        let small_alignment = if small { u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT) } else { 0 };
         let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
         let (mut rows, mut row_bytes, mut total) = (0u32, 0u64, 0u64);
-        let probe = texture_desc(16, 4, DXGI_FORMAT_R16G16B16A16_FLOAT, 0);
+        let probe = texture_desc(width, height, format, 0);
         device.GetCopyableFootprints(
             &probe,
             0,
@@ -382,6 +532,10 @@ fn main() {
             persist(&mut gpu, &device, &allocator, &list, &upload, &heap, slot, footprint, iterations);
             return;
         }
+        if scenario == "alias" {
+            alias_copy(&mut gpu, &device, &allocator, &list, &upload, width, height, format, DXGI_FORMAT(67), iterations, copies_per_list);
+            return;
+        }
 
         let mut seed = 0x9e3779b97f4a7c15u64;
         let mut next = move || {
@@ -395,7 +549,7 @@ fn main() {
             allocator.Reset().unwrap();
             list.Reset(&allocator, None).unwrap();
             live.clear();
-            for copy in 0..COPIES_PER_LIST {
+            for _copy in 0..copies_per_list {
                 let slot_index = (next() % slots).min(slots - 1);
                 let texture: ID3D12Resource = if scenario == "committed" {
                     let mut t: Option<ID3D12Resource> = None;
@@ -403,7 +557,7 @@ fn main() {
                         .CreateCommittedResource(
                             &default_props,
                             D3D12_HEAP_FLAG_NONE,
-                            &texture_desc(16, 4, DXGI_FORMAT_R16G16B16A16_FLOAT, 0),
+                            &texture_desc(width, height, format, 0),
                             D3D12_RESOURCE_STATE_COPY_DEST,
                             None,
                             &mut t,
@@ -416,7 +570,7 @@ fn main() {
                         ("churn", 1) => (32, 32, DXGI_FORMAT_R8G8B8A8_UNORM),
                         ("churn", 2) => (8, 8, DXGI_FORMAT_R32_FLOAT),
                         ("churn", 3) => (64, 16, DXGI_FORMAT_R16_FLOAT),
-                        _ => (16, 4, DXGI_FORMAT_R16G16B16A16_FLOAT),
+                        _ => (width, height, format),
                     };
                     let mut desc = texture_desc(w, h, f, small_alignment);
                     let info = device.GetResourceAllocationInfo(0, &[desc]);
@@ -444,7 +598,7 @@ fn main() {
                     t
                 };
                 // The copy of the game's upload: 896 bytes from a multiple of 512.
-                let at = (next() % (BLOCK / 512 - 4)) * 512;
+                let at = (next() % ((BLOCK - total) / 512 + 1)) * 512;
                 let to = D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(&texture),
                     Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
@@ -457,9 +611,8 @@ fn main() {
                         PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: at, ..footprint },
                     },
                 };
-                // (only the 16x4 shape's footprint fits what is copied here)
                 let shaped = texture.GetDesc();
-                if shaped.Width == 16 && shaped.Height == 4 && shaped.Format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+                if shaped.Width == width && shaped.Height == height && shaped.Format == format {
                     list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
                 }
                 let transition = D3D12_RESOURCE_BARRIER {
@@ -475,7 +628,6 @@ fn main() {
                     },
                 };
                 list.ResourceBarrier(&[transition]);
-                let _ = copy;
                 live.push(texture);
             }
             list.Close().unwrap();
@@ -487,6 +639,6 @@ fn main() {
                 eprintln!("{scenario}: {iteration} lists done");
             }
         }
-        println!("{scenario}: OK, {iterations} lists of {COPIES_PER_LIST} copies");
+        println!("{scenario}: OK, {iterations} lists of {copies_per_list} copies");
     }
 }
