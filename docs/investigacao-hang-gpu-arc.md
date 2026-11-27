@@ -640,17 +640,29 @@ por padrão sem conferir a semântica dos wave ops e a imagem.
 
 Na execução `configured-keep12-skip-aa017`, foram combinados
 `VICTORY_MESH_TEST=keep:1:2` e `VICTORY_SKIP_PIPELINES=aa017fca6b1feb21`. O filtro registrou
-11 linhas de descartes de `aa017`; o log terminou após 3 min 17 s com 2.823 `first bind`, 34
-linhas de FPS, FPS recente entre 0,8 e 1,1 e sem `DXGI_ERROR_DEVICE_HUNG`. O usuário informou
-que fechou o jogo manualmente. A captura de controle `configured-keep-aa017-21`, com o mesmo
-filtro mesh e `aa017` ativo, terminou em TDR após 1.789 binds e tinha o par
-`aa017 / c2c7` na janela DRED.
+11 linhas de descartes de `aa017`; o usuário encerrou a execução manualmente depois de 3 min 17 s,
+com 2.823 `first bind`. Essa captura é censurada e não demonstra ausência de TDR. Uma nova rodada
+Windows com o mesmo filtro e `aa017` ainda pulado terminou em `DXGI_ERROR_DEVICE_HUNG` às
+10:03:16 UTC, após 3.099 `first bind` e 42 linhas de FPS; portanto pular `aa017` sozinho não
+evita o hang.
 
-Esse par passa a ter uma contraprova direta no fluxo filtrado: ativo reproduz o TDR; omitido,
-o TDR não ocorre durante mais de 250 s, com o título continuando a reportar frames. A tela desse
-filtro não é uma validação visual do jogo completo. Junto com a contraprova e135 já registrada,
-o nexo com os pares wave64 AlphaPrepass fica forte; a captura completa ainda pode envolver outras
-variantes da mesma família.
+O teste isolado de `e38865315b050ed9` também não evita o TDR. Com
+`VICTORY_MESH_TEST=keep:1:2`, `VICTORY_SKIP_PIPELINES=e38865315b050ed9` e builder BVH desligado,
+o log confirmou dois descartes de `e388`, nenhum descarte de `aa017`, e terminou em TDR às
+10:25:26 UTC, após 2.584 `first bind` e 15 linhas de FPS. O DRED apontou uma submissão de 29
+listas e incluiu dispatches compute; o comando marcado não identifica sozinho a causa.
+
+Na contraprova combinada, com `VICTORY_SKIP_PIPELINES=aa017fca6b1feb21,e38865315b050ed9`, ambos
+os descartes foram confirmados no log (30 eventos `aa017`, 62 `e388`). A execução passou de
+10 min, chegou a 3.866 `first bind` e 105 linhas de FPS sem `DXGI_ERROR_DEVICE_HUNG`; foi encerrada
+por nós para iniciar o teste isolado seguinte. O FPS variou bastante (~1–8), com carga alta de
+draws indiretos, portanto a rodada comprova estabilidade do device nessa janela filtrada, não
+correção visual nem desempenho aceitável.
+
+As três medições são compatíveis com múltiplos fatores: pular cada shader isoladamente não
+eliminou o TDR, enquanto pular ambos evitou-o por mais de 10 min. Isso ainda não prova causalidade
+individual nem interação entre eles: os TDRs podem depender de outros shaders, estado/carga ou
+ordem de submissão. Os dois nomes são candidatos para investigação, não causas confirmadas.
 
 ### Limite de wave ops em mesh (2026-11-27)
 
@@ -663,9 +675,8 @@ outras reduções são recusadas. Isso afasta a hipótese de que o DXIL emitido 
 diretamente uma wave DXIL de 64 lanes, mas deixa uma lacuna semântica possível: reduções min/max
 de um shader wave64 são executadas por wave física (16–32 lanes), não pela wave lógica completa.
 
-A correlação do hang com os pares AlphaPrepass continua sendo evidência de runtime; a captura
-de `aa017` com pipeline omitida é censurada pelo fechamento manual do usuário e não deve ser
-descrita como execução concluída sem hang.
+A correlação do hang com os pares AlphaPrepass continua sendo evidência de runtime, sem fechar a
+causalidade; a antiga captura encerrada manualmente permanece censurada.
 
 O mapeamento confirma uma incompatibilidade mais específica nas duas variantes mesh. Os cinco
 `v_readfirstlane_b32` de `e135` aparecem no DXIL como cinco `dx.op.waveReadLaneFirst.i32`. A
