@@ -863,8 +863,9 @@ fn emit_inner(
 /// lowering names the blocks where the two host waves must meet and could not
 /// (`lower::take_needs`), the branches whose regions hold them are widened, and so on until
 /// it translates or a branch cannot be widened. Only where a thread group is one console
-/// wave: with several, the waves of a group would decide differently and a barrier inside
-/// such a branch would wait for threads that never come.
+/// wave (or, with `VICTORY_WIDE_GROUPS=1`, a multiple of it): with several, the waves of a
+/// group would decide differently and a barrier inside such a branch would wait for threads
+/// that never come.
 fn widen(
     c: &Container,
     native: &NativeProgram,
@@ -880,6 +881,14 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        // Experiment (`VICTORY_WIDE_GROUPS=1`, opt-in): groups of several console waves. A branch
+        // taken wave-wide holds a group barrier that the other console waves of the group may
+        // never reach. Validation and pipeline creation do not prove that cannot deadlock at run
+        // time, and the results of the programs it lets through are not checked yet.
+        crate::native::StageIo::Cs(cs)
+            if cs.threads.iter().product::<u32>() > 0
+                && cs.threads.iter().product::<u32>() % 64 == 0
+                && std::env::var_os("VICTORY_WIDE_GROUPS").is_some_and(|v| v == "1") => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
