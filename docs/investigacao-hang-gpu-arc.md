@@ -663,20 +663,19 @@ outras reduções são recusadas. Isso afasta a hipótese de que o DXIL emitido 
 diretamente uma wave DXIL de 64 lanes, mas deixa uma lacuna semântica possível: reduções min/max
 de um shader wave64 são executadas por wave física (16–32 lanes), não pela wave lógica completa.
 
-Ainda não foi demonstrado que essa lacuna afeta `e135` ou `aa017`: o census registra presença
-de operações wave, mas precisamos mapear cada operação nativa dos dois shaders e o resultado
-DXIL correspondente. A correlação do hang com os pares AlphaPrepass continua sendo evidência
-de runtime; a captura de `aa017` com pipeline omitida é censurada pelo fechamento manual do
-usuário e não deve ser descrita como execução concluída sem hang.
+A correlação do hang com os pares AlphaPrepass continua sendo evidência de runtime; a captura
+de `aa017` com pipeline omitida é censurada pelo fechamento manual do usuário e não deve ser
+descrita como execução concluída sem hang.
 
-O mapeamento do caso `e135` agora confirma uma incompatibilidade mais específica. Os cinco
-`v_readfirstlane_b32` do shader aparecem no DXIL como cinco `dx.op.waveReadLaneFirst.i32`. A
-segunda variante `aa017` também tem nove `v_readfirstlane_b32` no código nativo e 9 `wave_op`
-no census (o c2c7 tem 15). O lowering de mesh chama `first_lane()`, que usa a wave física DXIL. O intercâmbio entre duas
+O mapeamento confirma uma incompatibilidade mais específica nas duas variantes mesh. Os cinco
+`v_readfirstlane_b32` de `e135` aparecem no DXIL como cinco `dx.op.waveReadLaneFirst.i32`. A
+segunda variante, `aa017`, tem nove `v_readfirstlane_b32` nativos e o DXIL retransladado tem
+nove `dx.op.waveReadLaneFirst.i32`; o pixel `c2c7` não contém essas chamadas. O lowering de mesh
+chama `first_lane()`, que usa a wave física DXIL. O intercâmbio entre duas
 metades de 32 lanes só é gerado quando `exchange` existe; essa adaptação é preparada dentro do
 caminho de compute (`StageIo::Cs`). Portanto, se o operando varia entre lanes 0–31 e 32–63, as
 duas metades do host leem valores diferentes, enquanto a wave64 do console escolhe um único
-primeiro lane. Isso demonstra divergência semântica possível no shader emitido, mas ainda não
-prova que esse operando varia nos pontos correspondentes nem que a divergência é a causa direta
-do TDR. Para `aa017`, temos o disassembly nativo, mas ainda não uma listagem DXIL emitida que
-permita casar cada um dos nove pontos.
+primeiro lane. Isso demonstra o mapeamento semântico incompatível no DXIL emitido, mas ainda
+não prova que algum desses operandos difere entre as duas metades em runtime nem que a
+divergência é a causa direta do TDR. A retranslação foi offline, wave máxima 32, sem validação
+de pipeline ou desenho; não altera os resultados de runtime registrados acima.
